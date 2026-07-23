@@ -26,6 +26,7 @@ from tau_agent import (
     AgentStartEvent,
     AgentToolResult,
     AssistantMessage,
+    CompactionSummaryMessage,
     CustomMessage,
     MessageEndEvent,
     MessageStartEvent,
@@ -39,12 +40,19 @@ from tau_agent import (
     ToolResultMessage,
     UserMessage,
 )
+from tau_agent.harness import QueuedMessages
 from tau_agent.messages import assistant_content
 from tau_agent.provider_events import TextDeltaEvent, ThinkingDeltaEvent
 from tau_coding.catalog_loader import user_catalog_path
 from tau_coding.commands import CommandResult
 from tau_coding.credentials import FileCredentialStore, OAuthCredential
-from tau_coding.events import AgentSettledEvent, CodingSessionEvent, QueueUpdateEvent
+from tau_coding.events import (
+    AgentSettledEvent,
+    CodingSessionEvent,
+    CompactionEndEvent,
+    CompactionStartEvent,
+    QueueUpdateEvent,
+)
 from tau_coding.paths import TauPaths
 from tau_coding.prompt_templates import PromptTemplate
 from tau_coding.provider_config import (
@@ -422,6 +430,15 @@ class FakeSession:
             ok=True,
             added_to_context=add_to_context,
         )
+
+    def clear_queued_messages(self) -> QueuedMessages:
+        queued = QueuedMessages(
+            steering=tuple(UserMessage(content=text) for text in self.queued_steering_messages),
+            follow_up=tuple(UserMessage(content=text) for text in self.queued_follow_up_messages),
+        )
+        self.queued_steering_messages = ()
+        self.queued_follow_up_messages = ()
+        return queued
 
     def pop_latest_follow_up_message(self) -> str | None:
         if not self.queued_follow_up_messages:
@@ -3724,6 +3741,468 @@ async def test_tui_app_new_command_starts_new_visible_state() -> None:
 
 
 @pytest.mark.anyio
+async def test_tui_app_shows_auto_compaction_and_reloads_compacted_transcript() -> None:
+    started = asyncio.Event()
+    finish = asyncio.Event()
+    completed = asyncio.Event()
+
+    class AutoCompactingSession(FakeSession):
+        async def prompt(
+            self,
+            text: str,
+            **kwargs: object,
+        ) -> AsyncIterator[CodingSessionEvent]:
+            streaming_behavior = kwargs.get("streaming_behavior")
+            self.prompt_texts.append(text)
+            self.streaming_behaviors.append(
+                streaming_behavior if isinstance(streaming_behavior, str) else None
+            )
+            if streaming_behavior == "steer":
+                self.queued_steering_messages = (*self.queued_steering_messages, text)
+                yield self.queue_update_event()
+                return
+            if streaming_behavior == "follow_up":
+                self.queued_follow_up_messages = (*self.queued_follow_up_messages, text)
+                yield self.queue_update_event()
+                return
+
+            yield CompactionStartEvent(reason="threshold")
+            started.set()
+            await finish.wait()
+            summary = CompactionSummaryMessage(
+                summary="Generated automatic summary",
+                tokens_before=12_034,
+            )
+            self.messages = (summary,)
+            yield CompactionEndEvent(reason="threshold", result={"summary": summary.summary})
+            user_messages = [UserMessage(content=text)]
+            self.messages = (summary, *user_messages)
+            yield AgentStartEvent()
+            yield MessageEndEvent(message=user_messages[0])
+            for queued_text in (
+                *self.queued_steering_messages,
+                *self.queued_follow_up_messages,
+            ):
+                queued_message = UserMessage(content=queued_text)
+                user_messages.append(queued_message)
+                self.messages = (*self.messages, queued_message)
+                yield MessageEndEvent(message=queued_message)
+            self.queued_steering_messages = ()
+            self.queued_follow_up_messages = ()
+            yield self.queue_update_event()
+            yield AgentEndEvent(messages=user_messages)
+            yield AgentSettledEvent()
+            completed.set()
+
+    session = AutoCompactingSession(messages=[UserMessage(content="Earlier context")])
+    app = TauTuiApp(session)
+    notifications: list[tuple[str, str]] = []
+
+    def fake_notify(message: str, *, severity: str = "information", **kwargs: object) -> None:
+        del kwargs
+        notifications.append((message, severity))
+
+    app._notify = fake_notify  # type: ignore[method-assign]
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt", PromptInput)
+        prompt.text = "First prompt"
+        await pilot.press("enter")
+        await asyncio.wait_for(started.wait(), timeout=1)
+        await pilot.pause()
+
+        assert app.state.compaction_reason == "threshold"
+        assert [(item.role, item.text) for item in app.state.items] == [
+            ("user", "Earlier context"),
+            ("user", "First prompt"),
+            ("status", "Auto-compacting…"),
+        ]
+
+        prompt.text = "Second prompt"
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert prompt.text == ""
+        assert session.prompt_texts == ["First prompt"]
+        assert app.state.queued_steering == ("Second prompt",)
+        assert [item.text for item in app.state.items if item.role == "user"] == [
+            "Earlier context",
+            "First prompt",
+        ]
+        assert notifications == [("Queued message for after compaction", "information")]
+
+        prompt.text = "Follow-up prompt"
+        await app.action_submit_follow_up()
+        await pilot.pause()
+
+        assert prompt.text == ""
+        assert app.state.queued_steering == ("Second prompt",)
+        assert app.state.queued_follow_up == ("Follow-up prompt",)
+
+        finish.set()
+        await asyncio.wait_for(completed.wait(), timeout=1)
+        await pilot.pause()
+
+        assert app.state.compaction_reason is None
+        assert [(item.role, item.text) for item in app.state.items] == [
+            ("compaction_summary", "Compaction summary (Ctrl+O to expand)"),
+            ("user", "First prompt"),
+            ("user", "Second prompt"),
+            ("user", "Follow-up prompt"),
+        ]
+        assert app.state.queued_message_count == 0
+        assert session.streaming_behaviors == [None, "steer", "follow_up"]
+        assert app.state.items[0].tool_result_text == "Generated automatic summary"
+
+
+@pytest.mark.anyio
+async def test_tui_app_starts_first_queued_prompt_after_post_turn_compaction() -> None:
+    compaction_started = asyncio.Event()
+    finish_compaction = asyncio.Event()
+    second_prompt_started = asyncio.Event()
+
+    class PostTurnCompactingSession(FakeSession):
+        async def prompt(
+            self,
+            text: str,
+            **kwargs: object,
+        ) -> AsyncIterator[CodingSessionEvent]:
+            streaming_behavior = kwargs.get("streaming_behavior")
+            self.prompt_texts.append(text)
+            self.streaming_behaviors.append(
+                streaming_behavior if isinstance(streaming_behavior, str) else None
+            )
+            user_message = UserMessage(content=text)
+            if len(self.prompt_texts) == 1:
+                self.messages = (user_message,)
+                yield AgentStartEvent()
+                yield MessageEndEvent(message=user_message)
+                yield AgentEndEvent(messages=[user_message])
+                yield CompactionStartEvent(reason="threshold")
+                compaction_started.set()
+                await finish_compaction.wait()
+                summary = CompactionSummaryMessage(
+                    summary="Generated automatic summary",
+                    tokens_before=12_034,
+                )
+                self.messages = (summary,)
+                yield CompactionEndEvent(
+                    reason="threshold",
+                    result={"summary": summary.summary},
+                )
+                yield AgentSettledEvent()
+                return
+
+            second_prompt_started.set()
+            self.messages = (*self.messages, user_message)
+            yield AgentStartEvent()
+            yield MessageEndEvent(message=user_message)
+            yield AgentEndEvent(messages=[user_message])
+            yield AgentSettledEvent()
+
+    session = PostTurnCompactingSession()
+    app = TauTuiApp(session)
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt", PromptInput)
+        prompt.text = "First prompt"
+        await pilot.press("enter")
+        await asyncio.wait_for(compaction_started.wait(), timeout=1)
+
+        prompt.text = "Second prompt"
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert prompt.text == ""
+        assert session.prompt_texts == ["First prompt"]
+        assert app.state.queued_steering == ("Second prompt",)
+        assert [item.text for item in app.state.items if item.role == "user"] == ["First prompt"]
+
+        finish_compaction.set()
+        await asyncio.wait_for(second_prompt_started.wait(), timeout=1)
+        await pilot.pause()
+
+        assert session.prompt_texts == ["First prompt", "Second prompt"]
+        assert session.streaming_behaviors == [None, None]
+        assert app.state.queued_message_count == 0
+        assert [(item.role, item.text) for item in app.state.items] == [
+            ("compaction_summary", "Compaction summary (Ctrl+O to expand)"),
+            ("user", "Second prompt"),
+        ]
+
+
+@pytest.mark.anyio
+async def test_tui_app_auto_compaction_failure_restores_transcript() -> None:
+    session = FakeSession(
+        messages=[UserMessage(content="Earlier context")],
+        events=[
+            CompactionStartEvent(reason="threshold"),
+            CompactionEndEvent(
+                reason="threshold",
+                error_message="summary provider failed",
+            ),
+        ],
+    )
+    app = TauTuiApp(session)
+    notifications: list[tuple[str, str]] = []
+
+    def fake_notify(message: str, *, severity: str = "information", **kwargs: object) -> None:
+        del kwargs
+        notifications.append((message, severity))
+
+    app._notify = fake_notify  # type: ignore[method-assign]
+
+    async with app.run_test() as pilot:
+        await app._submit_prompt("First prompt")
+        await pilot.pause()
+
+        assert app.state.compaction_reason is None
+        assert app.state.error == "Auto-compaction failed: summary provider failed"
+        assert [(item.role, item.text) for item in app.state.items] == [("user", "Earlier context")]
+        assert notifications == [("Auto-compaction failed: summary provider failed", "error")]
+
+
+@pytest.mark.anyio
+async def test_tui_app_escape_cancels_auto_compaction() -> None:
+    started = asyncio.Event()
+    finish = asyncio.Event()
+
+    class AutoCompactingSession(FakeSession):
+        async def prompt(
+            self,
+            text: str,
+            **kwargs: object,
+        ) -> AsyncIterator[CodingSessionEvent]:
+            del text, kwargs
+            yield CompactionStartEvent(reason="threshold")
+            started.set()
+            await finish.wait()
+
+    session = AutoCompactingSession(messages=[UserMessage(content="Earlier context")])
+    app = TauTuiApp(session)
+    notifications: list[tuple[str, str]] = []
+
+    def fake_notify(message: str, *, severity: str = "information", **kwargs: object) -> None:
+        del kwargs
+        notifications.append((message, severity))
+
+    app._notify = fake_notify  # type: ignore[method-assign]
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt", PromptInput)
+        prompt.text = "First prompt"
+        await pilot.press("enter")
+        await asyncio.wait_for(started.wait(), timeout=1)
+        await pilot.pause()
+
+        prompt.text = "Second prompt"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert prompt.text == ""
+
+        await pilot.press("escape")
+        await pilot.pause()
+
+        assert prompt.text == "Second prompt"
+        assert app.state.compaction_reason is None
+        assert app._prompt_worker is None
+        assert session.cancel_count == 1
+        assert [(item.role, item.text) for item in app.state.items] == [("user", "Earlier context")]
+        assert notifications == [
+            ("Queued message for after compaction", "information"),
+            ("Cancelled compaction.", "information"),
+        ]
+
+
+@pytest.mark.anyio
+async def test_tui_app_cancellation_restores_queue_after_compaction_end() -> None:
+    compaction_started = asyncio.Event()
+    release_compaction = asyncio.Event()
+    after_compaction_end = asyncio.Event()
+    finish = asyncio.Event()
+
+    class CompactionEndGapSession(FakeSession):
+        compacting = False
+
+        @property
+        def is_compacting(self) -> bool:
+            return self.compacting
+
+        def abort_compaction(self) -> bool:
+            return False
+
+        async def prompt(
+            self,
+            text: str,
+            **kwargs: object,
+        ) -> AsyncIterator[CodingSessionEvent]:
+            del text, kwargs
+            self.compacting = True
+            yield CompactionStartEvent(reason="threshold")
+            compaction_started.set()
+            await release_compaction.wait()
+            yield CompactionEndEvent(reason="threshold", result={"summary": "done"})
+            after_compaction_end.set()
+            await finish.wait()
+            self.compacting = False
+
+    session = CompactionEndGapSession(messages=[UserMessage(content="Earlier context")])
+    app = TauTuiApp(session)
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt", PromptInput)
+        prompt.text = "First prompt"
+        await pilot.press("enter")
+        await asyncio.wait_for(compaction_started.wait(), timeout=1)
+
+        prompt.text = "Second prompt"
+        await pilot.press("enter")
+        release_compaction.set()
+        await asyncio.wait_for(after_compaction_end.wait(), timeout=1)
+        await pilot.pause()
+
+        assert app.state.compaction_reason is None
+        assert session.is_compacting is True
+        assert app.state.queued_steering == ("Second prompt",)
+
+        await pilot.press("escape")
+        await pilot.pause()
+
+        assert prompt.text == "Second prompt"
+        assert app._prompt_worker is None
+        assert app.state.queued_message_count == 0
+
+
+@pytest.mark.anyio
+async def test_tui_app_cancellation_restores_queue_after_agent_start_transfer() -> None:
+    compaction_started = asyncio.Event()
+    release_compaction = asyncio.Event()
+    transferred = asyncio.Event()
+    finish = asyncio.Event()
+
+    class TransferGapSession(FakeSession):
+        async def prompt(
+            self,
+            text: str,
+            **kwargs: object,
+        ) -> AsyncIterator[CodingSessionEvent]:
+            streaming_behavior = kwargs.get("streaming_behavior")
+            if streaming_behavior == "steer":
+                self.queued_steering_messages = (*self.queued_steering_messages, text)
+                yield self.queue_update_event()
+                return
+            if streaming_behavior == "follow_up":
+                self.queued_follow_up_messages = (*self.queued_follow_up_messages, text)
+                yield self.queue_update_event()
+                return
+
+            yield CompactionStartEvent(reason="threshold")
+            compaction_started.set()
+            await release_compaction.wait()
+            yield CompactionEndEvent(reason="threshold", result={"summary": "done"})
+            yield AgentStartEvent()
+            transferred.set()
+            await finish.wait()
+
+    session = TransferGapSession(messages=[UserMessage(content="Earlier context")])
+    app = TauTuiApp(session)
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt", PromptInput)
+        prompt.text = "First prompt"
+        await pilot.press("enter")
+        await asyncio.wait_for(compaction_started.wait(), timeout=1)
+
+        prompt.text = "Second prompt"
+        await pilot.press("enter")
+        release_compaction.set()
+        await asyncio.wait_for(transferred.wait(), timeout=1)
+        await pilot.pause()
+
+        assert session.queued_steering_messages == ("Second prompt",)
+
+        await pilot.press("escape")
+        await pilot.pause()
+
+        assert prompt.text == "Second prompt"
+        assert session.queued_steering_messages == ()
+        assert app.state.queued_message_count == 0
+
+
+@pytest.mark.anyio
+async def test_tui_app_queues_repeated_submit_while_prompt_worker_is_starting() -> None:
+    started = asyncio.Event()
+    finish = asyncio.Event()
+
+    class SlowStartingSession(FakeSession):
+        async def prompt(
+            self,
+            text: str,
+            **kwargs: object,
+        ) -> AsyncIterator[CodingSessionEvent]:
+            streaming_behavior = kwargs.get("streaming_behavior")
+            self.prompt_texts.append(text)
+            self.streaming_behaviors.append(
+                streaming_behavior if isinstance(streaming_behavior, str) else None
+            )
+            if streaming_behavior == "steer":
+                self.queued_steering_messages = (*self.queued_steering_messages, text)
+                yield self.queue_update_event()
+                return
+            if streaming_behavior == "follow_up":
+                self.queued_follow_up_messages = (*self.queued_follow_up_messages, text)
+                yield self.queue_update_event()
+                return
+
+            started.set()
+            await finish.wait()
+            user_messages = [UserMessage(content=text)]
+            self.messages = (*self.messages, user_messages[0])
+            yield AgentStartEvent()
+            yield MessageEndEvent(message=user_messages[0])
+            for queued_text in self.queued_steering_messages:
+                queued_message = UserMessage(content=queued_text)
+                user_messages.append(queued_message)
+                self.messages = (*self.messages, queued_message)
+                yield MessageEndEvent(message=queued_message)
+            self.queued_steering_messages = ()
+            yield self.queue_update_event()
+            yield AgentEndEvent(messages=user_messages)
+            yield AgentSettledEvent()
+
+    session = SlowStartingSession()
+    app = TauTuiApp(session)
+    notifications: list[tuple[str, str]] = []
+
+    def fake_notify(message: str, *, severity: str = "information", **kwargs: object) -> None:
+        del kwargs
+        notifications.append((message, severity))
+
+    app._notify = fake_notify  # type: ignore[method-assign]
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt", PromptInput)
+        prompt.text = "First prompt"
+        await pilot.press("enter")
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+        prompt.text = "Second prompt"
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert prompt.text == ""
+        assert session.prompt_texts == ["First prompt"]
+        assert app.state.queued_steering == ("Second prompt",)
+        assert [item.text for item in app.state.items if item.role == "user"] == ["First prompt"]
+        assert notifications == [("Queued message for the current turn", "information")]
+
+        finish.set()
+        await pilot.pause()
+
+        assert session.streaming_behaviors == [None, "steer"]
+
+
+@pytest.mark.anyio
 async def test_tui_app_compact_command_runs_session_compaction() -> None:
     session = FakeSession(messages=[UserMessage(content="Earlier")])
     app = TauTuiApp(session)
@@ -3794,13 +4273,102 @@ async def test_tui_app_blocks_session_commands_while_compacting(blocked_command:
         assert session.resumed_session_ids == []
         assert prompt.value == blocked_command
         assert notifications == [
-            "Compaction is still running. You can keep editing, but wait to submit."
+            "Compaction is still running. Wait for it to finish before running commands."
         ]
 
         finish.set()
         await pilot.pause()
 
         assert session.compact_summaries == ["Summary of earlier work."]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("terminal_text", ["!pwd", "!!pwd"])
+async def test_tui_app_keeps_terminal_commands_in_editor_while_compacting(
+    terminal_text: str,
+) -> None:
+    started = asyncio.Event()
+    finish = asyncio.Event()
+
+    class SlowCompactSession(FakeSession):
+        async def compact(self, summary: str) -> str:
+            del summary
+            started.set()
+            await finish.wait()
+            return "Compacted 2 context entries."
+
+    session = SlowCompactSession(messages=[UserMessage(content="Earlier")])
+    app = TauTuiApp(session)
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt", PromptInput)
+        prompt.text = "/compact"
+        await pilot.press("enter")
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+        prompt.text = terminal_text
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert prompt.text == terminal_text
+        assert session.terminal_commands == []
+        assert app.state.queued_message_count == 0
+
+        finish.set()
+        await pilot.pause()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("resource_text", ["/skill:review check auth", "/review"])
+async def test_tui_app_queues_prompt_resources_while_compacting(resource_text: str) -> None:
+    started = asyncio.Event()
+    finish = asyncio.Event()
+    prompt_started = asyncio.Event()
+
+    class SlowCompactSession(FakeSession):
+        def expand_prompt_text(self, text: str) -> str:
+            if text == "/review":
+                return "Expanded review template"
+            return text
+
+        async def compact(self, summary: str) -> str:
+            del summary
+            started.set()
+            await finish.wait()
+            return "Compacted 2 context entries."
+
+        async def prompt(self, text: str, **kwargs: object) -> AsyncIterator[CodingSessionEvent]:
+            self.prompt_texts.append(text)
+            prompt_started.set()
+            user_message = UserMessage(content=text)
+            self.messages = (*self.messages, user_message)
+            yield AgentStartEvent()
+            yield MessageEndEvent(message=user_message)
+            yield AgentEndEvent(messages=[user_message])
+            yield AgentSettledEvent()
+
+    session = SlowCompactSession(messages=[UserMessage(content="Earlier")])
+    app = TauTuiApp(session)
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt", PromptInput)
+        prompt.text = "/compact"
+        await pilot.press("enter")
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+        prompt.text = resource_text
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert prompt.text == ""
+        assert app.state.queued_steering == (resource_text,)
+        assert session.prompt_texts == []
+
+        finish.set()
+        await asyncio.wait_for(prompt_started.wait(), timeout=1)
+        await pilot.pause()
+
+        assert session.prompt_texts == [resource_text]
 
 
 @pytest.mark.anyio
@@ -3924,6 +4492,43 @@ async def test_tui_app_export_command_runs_session_export() -> None:
         assert session.export_calls == [(Path("out.jsonl"), "jsonl")]
         assert notifications == ["Exported session to /workspace/project/session.html"]
         assert session.prompt_texts == []
+
+
+@pytest.mark.anyio
+async def test_tui_app_blocks_session_picker_during_pre_prompt_compaction() -> None:
+    record = CodingSessionRecord(
+        id="session-1",
+        path=Path("/workspace/project/session-1.jsonl"),
+        cwd=Path("/workspace/project"),
+        model="fake-model",
+        title="Test session",
+        created_at=1.0,
+        updated_at=2.0,
+    )
+    session = FakeSession()
+    session.session_manager = _FakeSessionManager([record])
+    app = TauTuiApp(session)
+    notifications: list[str] = []
+
+    def fake_notify(message: str, **kwargs: object) -> None:
+        del kwargs
+        notifications.append(message)
+
+    app._notify = fake_notify  # type: ignore[method-assign]
+
+    async with app.run_test() as pilot:
+        app.state.compaction_reason = "threshold"
+
+        app.action_open_session_picker()
+        app._handle_session_picker_result("session-1")
+        await pilot.pause()
+
+        assert not isinstance(app.screen, SessionPickerScreen)
+        assert session.resumed_session_ids == []
+        assert notifications == [
+            "Tau is already working. Press Escape to cancel.",
+            "Tau is already working. Press Escape to cancel.",
+        ]
 
 
 @pytest.mark.anyio

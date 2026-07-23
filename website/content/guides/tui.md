@@ -40,14 +40,19 @@ conversation history.
 
 While the agent is working you don't have to wait:
 
-- **Esc** cancels the active run. Cancellation is treated as an intentional stop,
-  not an error.
+- **Esc** cancels the active run or automatic compaction. Cancellation is treated
+  as an intentional stop, not an error.
 - **Enter** (while running) queues your text as **steering** — extra guidance
   applied to the current run.
 - **Alt+Enter** queues a **follow-up** — a prompt that waits until the current
   run would otherwise finish.
 - Press **Up** on an empty prompt while running to pull the most recently queued
   follow-up back into the prompt for editing.
+
+During automatic compaction, Tau shows `Auto-compacting…` and keeps the editor
+available. Entered messages move to the pending-message area and retain their
+steering or follow-up mode. Tau delivers them after compaction instead of
+replacing the prompt worker that initiated it.
 
 ## The command palette and slash commands
 

@@ -63,6 +63,7 @@ class TuiState:
     items: list[ChatItem] = field(default_factory=list)
     assistant_buffer: str = ""
     running: bool = False
+    compaction_reason: Literal["manual", "threshold", "overflow"] | None = None
     error: str | None = None
     show_tool_results: bool = False
     show_thinking: bool = False

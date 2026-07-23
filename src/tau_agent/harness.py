@@ -155,6 +155,15 @@ class AgentHarness:
     def continue_(self) -> AsyncIterator[AgentEvent]:
         self._ensure_not_running()
         self._append_interrupted_tool_results()
+        # A follow-up queued by an agent_end listener arrives after the loop's
+        # normal follow-up drain. Promote it to the next continuation prompt.
+        if (
+            self._messages
+            and isinstance(self._messages[-1], AssistantMessage)
+            and not self._steering_queue
+            and self._follow_up_queue
+        ):
+            self._steering_queue.extend(self._drain_queue(self._follow_up_queue))
         self._running = True
         return self._run()
 
