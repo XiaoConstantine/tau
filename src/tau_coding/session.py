@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import string
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, replace
@@ -66,6 +67,7 @@ from tau_coding.events import (
     AutoRetryStartEvent,
     CodingSessionEvent,
     CompactionEndEvent,
+    CompactionReason,
     CompactionStartEvent,
     QueueUpdateEvent,
     SessionAgentEndEvent,
@@ -278,6 +280,10 @@ class CodingSession:
         self._resource_paths = resource_paths_with_cwd(config.resource_paths, config.cwd)
         self._auto_compact_token_threshold = config.auto_compact_token_threshold
         self._auto_compact_enabled = config.auto_compact_enabled
+        self._operation_active = False
+        self._compaction_reason: CompactionReason | None = None
+        self._compaction_task: asyncio.Task[CompactionEntry] | None = None
+        self._compaction_cancel_requested = False
         self._thinking_level = _state_thinking_level(
             state,
             default=_default_thinking_level_for_active_model(self),
@@ -509,7 +515,7 @@ class CodingSession:
         replace_instructions: bool = False,
     ) -> SessionTreeBranchResult:
         """Move the active leaf to a previous entry, preserving existing history."""
-        if self._harness.is_running:
+        if self._operation_active or self.is_compacting:
             raise RuntimeError(TREE_RUNNING_MESSAGE)
         entries = await self._read_session_entries()
         by_id = {entry.id: entry for entry in entries}
@@ -826,8 +832,17 @@ class CodingSession:
 
     @property
     def is_running(self) -> bool:
-        """Return whether this session currently has an active agent run."""
-        return self._harness.is_running
+        """Return whether a prompt, agent run, or post-run operation is active."""
+        return self._operation_active
+
+    @property
+    def is_compacting(self) -> bool:
+        """Return whether session-managed compaction is in progress."""
+        return self._compaction_reason is not None
+
+    def _ensure_operation_idle(self, action: str) -> None:
+        if self._operation_active or self.is_compacting:
+            raise RuntimeError(f"Cannot {action} while Tau is working")
 
     @property
     def queued_messages(self) -> QueuedMessages:
@@ -853,6 +868,15 @@ class CodingSession:
         """Cancel the currently running agent turn, if any."""
         self._harness.cancel()
 
+    def abort_compaction(self) -> bool:
+        """Request cancellation of the active compaction task."""
+        task = self._compaction_task
+        if task is None or task.done():
+            return False
+        self._compaction_cancel_requested = True
+        task.cancel()
+        return True
+
     def queue_update_event(self) -> QueueUpdateEvent:
         """Return the current queue state as a coding-session event."""
         return QueueUpdateEvent(
@@ -876,6 +900,7 @@ class CodingSession:
 
     def set_model(self, model: str) -> None:
         """Switch the active model for future turns and make it the default."""
+        self._ensure_operation_idle("switch models")
         provider = self._active_provider_config()
         if provider is not None:
             validate_provider_model(provider, model)
@@ -892,6 +917,7 @@ class CodingSession:
 
     def set_model_choice(self, choice: ModelChoice) -> None:
         """Switch provider/model as one operation."""
+        self._ensure_operation_idle("switch models")
         if choice.provider_name == self.provider_name:
             self.set_model(choice.model)
             return
@@ -937,6 +963,7 @@ class CodingSession:
 
     def set_provider(self, provider_name: str, *, persist_default: bool = True) -> None:
         """Switch the active provider and reset to that provider's default model."""
+        self._ensure_operation_idle("switch providers")
         if self._provider_settings is None:
             raise ProviderConfigError("Provider settings are not available for this session")
         provider_config = self._provider_settings.get_provider(provider_name)
@@ -1133,6 +1160,7 @@ class CodingSession:
         ``session_start(reason="reload")`` so startup-mounted UI is restored
         before the command reports completion.
         """
+        self._ensure_operation_idle("reload the session")
         await self._extension_runtime.emit_session_shutdown("reload")
         before_skills = _skill_signatures(self._skills)
         before_prompt_templates = _prompt_template_signatures(self._prompt_templates)
@@ -1238,6 +1266,7 @@ class CodingSession:
 
     def reload_provider_settings(self) -> None:
         """Reload provider settings for login and model-selection flows."""
+        self._ensure_operation_idle("reload provider settings")
         if self._provider_settings is None:
             return
         previous_settings = self._provider_settings
@@ -1253,6 +1282,7 @@ class CodingSession:
 
     async def resume(self, session_id: str) -> str:
         """Replace this session's active state with another indexed session."""
+        self._ensure_operation_idle("resume another session")
         manager = self._config.session_manager
         if manager is None:
             raise ValueError("Session manager is not available")
@@ -1322,6 +1352,7 @@ class CodingSession:
 
     async def new_session(self) -> str:
         """Replace this session's active state with a pending unindexed session."""
+        self._ensure_operation_idle("start a new session")
         manager = self._config.session_manager
         if manager is None:
             raise ValueError("Session manager is not available")
@@ -1400,6 +1431,10 @@ class CodingSession:
         self._resource_paths = replacement._resource_paths
         self._auto_compact_token_threshold = replacement._auto_compact_token_threshold
         self._auto_compact_enabled = replacement._auto_compact_enabled
+        self._operation_active = False
+        self._compaction_reason = None
+        self._compaction_task = None
+        self._compaction_cancel_requested = False
         self._thinking_level = replacement._thinking_level
         self._pending_initial_entries = replacement._pending_initial_entries
         self._extension_runtime = replacement._extension_runtime
@@ -1409,16 +1444,21 @@ class CodingSession:
 
     async def compact(self, instructions: str | None = None) -> str:
         """Generate a manual compaction summary and rebuild active context."""
-        plan = self._manual_compaction_plan()
-        summary = await self._generate_compaction_summary(
-            plan.messages_to_summarize,
-            custom_instructions=instructions,
-        )
-        compaction = await self._append_compaction(
-            summary,
-            replace_entry_ids=plan.replace_entry_ids,
-        )
-        return f"Compacted {len(compaction.replaces_entry_ids)} context entries."
+        self._ensure_operation_idle("compact the session")
+        self._compaction_reason = "manual"
+        self._compaction_cancel_requested = False
+        try:
+            plan = self._manual_compaction_plan()
+            task = asyncio.create_task(
+                self._execute_compaction_plan(plan, custom_instructions=instructions)
+            )
+            self._compaction_task = task
+            compaction = await task
+            return f"Compacted {len(compaction.replaces_entry_ids)} context entries."
+        finally:
+            self._compaction_task = None
+            self._compaction_cancel_requested = False
+            self._compaction_reason = None
 
     async def aclose(self) -> None:
         """Close runtime providers created by this coding session."""
@@ -1466,6 +1506,7 @@ class CodingSession:
         add_to_context: bool,
     ) -> TerminalCommandResult:
         """Run a shell command in the session cwd, optionally adding output to context."""
+        self._ensure_operation_idle("run a terminal command")
         normalized_command = command.strip()
         if not normalized_command:
             raise ValueError("Terminal command cannot be empty")
@@ -1510,14 +1551,94 @@ class CodingSession:
         custom_type: str | None = None,
         details: dict[str, JSONValue] | None = None,
     ) -> AsyncIterator[CodingSessionEvent]:
-        """Append a user prompt, run the agent, and persist new messages.
+        """Serialize prompt operations and queue input when one is already active."""
+        if self._operation_active or self.is_compacting:
+            async for queue_event in self._queue_prompt_during_operation(
+                content,
+                streaming_behavior=streaming_behavior,
+                source=source,
+                custom_type=custom_type,
+                details=details,
+            ):
+                yield queue_event
+            return
 
-        ``custom_type``/``details`` attach custom-message render metadata to the
-        appended ``UserMessage`` (used when an extension delivers a custom
-        message that starts an idle session's turn). ``source`` marks who
-        initiated the turn for the `input` hook (``"extension"`` when an
-        extension started it, ``"interactive"`` otherwise).
-        """
+        self._operation_active = True
+        try:
+            async for prompt_event in self._prompt_operation(
+                content,
+                streaming_behavior=streaming_behavior,
+                source=source,
+                custom_type=custom_type,
+                details=details,
+            ):
+                yield prompt_event
+        finally:
+            self._operation_active = False
+
+    async def _queue_prompt_during_operation(
+        self,
+        content: str,
+        *,
+        streaming_behavior: StreamingBehavior | None,
+        source: Literal["interactive", "extension"],
+        custom_type: str | None,
+        details: dict[str, JSONValue] | None,
+    ) -> AsyncIterator[QueueUpdateEvent]:
+        if streaming_behavior not in {"steer", "follow_up"}:
+            raise RuntimeError(
+                "CodingSession is already running; pass streaming_behavior to queue a message."
+            )
+        context = self._diagnostic_context()
+        input_outcome = await self._extension_runtime.run_input_hooks(
+            content,
+            source=source,
+            streaming_behavior=streaming_behavior,
+        )
+        if input_outcome.handled:
+            if input_outcome.message:
+                self._extension_runtime.ui.notify(input_outcome.message)
+            return
+        try:
+            expanded_content = self.expand_prompt_text(input_outcome.text)
+        except ResourceError:
+            raise
+        except Exception as exc:
+            self._last_diagnostic_log_path = self._diagnostic_logger.log_exception(
+                context=context,
+                phase="expand_prompt",
+                exc=exc,
+            )
+            raise
+
+        message: AgentMessage = (
+            CustomMessage(
+                custom_type=custom_type,
+                content=expanded_content,
+                display=True,
+                details=details,
+            )
+            if custom_type is not None
+            else UserMessage(content=expanded_content)
+        )
+        if streaming_behavior == "steer":
+            self._harness.steer_message(message)
+        else:
+            self._harness.follow_up_message(message)
+        event = self.queue_update_event()
+        await self._extension_runtime.emit_event(event)
+        yield event
+
+    async def _prompt_operation(
+        self,
+        content: str,
+        *,
+        streaming_behavior: StreamingBehavior | None = None,
+        source: Literal["interactive", "extension"] = "interactive",
+        custom_type: str | None = None,
+        details: dict[str, JSONValue] | None = None,
+    ) -> AsyncIterator[CodingSessionEvent]:
+        """Append a user prompt, run the agent, and persist new messages."""
         context = self._diagnostic_context()
         input_outcome = await self._extension_runtime.run_input_hooks(
             content, source=source, streaming_behavior=streaming_behavior
@@ -1557,7 +1678,11 @@ class CodingSession:
             )
 
         await self._refresh_runtime_model_limits()
-        await self._try_auto_compact(context=context, phase="auto_compact_before_prompt")
+        async for compaction_event in self._try_auto_compact(
+            context=context,
+            phase="auto_compact_before_prompt",
+        ):
+            yield compaction_event
         persisted_count = len(self._harness.messages)
         auto_name_attempted = False
         overflow_message: AssistantMessage | None = None
@@ -1605,19 +1730,34 @@ class CodingSession:
                     await self._try_auto_name_session(auto_name_message, context=context)
             persisted_count = await self._persist_messages_since(persisted_count)
             if overflow_message is not None:
-                session_event_1 = CompactionStartEvent(reason="overflow")
-                await self._extension_runtime.emit_event(session_event_1)
-                yield session_event_1
-                compacted = await self._try_overflow_compact(context=context)
-                compaction_end = CompactionEndEvent(
-                    reason="overflow",
-                    result=None,
-                    aborted=not compacted,
-                    will_retry=compacted,
-                    error_message=None if compacted else "Overflow compaction failed",
-                )
-                await self._extension_runtime.emit_event(compaction_end)
-                yield compaction_end
+                self._compaction_reason = "overflow"
+                try:
+                    session_event_1 = CompactionStartEvent(reason="overflow")
+                    await self._extension_runtime.emit_event(session_event_1)
+                    yield session_event_1
+                    try:
+                        compacted = await self._try_overflow_compact(context=context)
+                    except asyncio.CancelledError:
+                        if not self._compaction_cancel_requested:
+                            raise
+                        compacted = False
+                        aborted = True
+                    else:
+                        aborted = False
+                    compaction_end = CompactionEndEvent(
+                        reason="overflow",
+                        result=None,
+                        aborted=aborted,
+                        will_retry=compacted,
+                        error_message=(
+                            None if compacted or aborted else "Overflow compaction failed"
+                        ),
+                    )
+                    await self._extension_runtime.emit_event(compaction_end)
+                    yield compaction_end
+                finally:
+                    self._compaction_cancel_requested = False
+                    self._compaction_reason = None
                 if compacted:
                     retry_start = AutoRetryStartEvent(
                         attempt=1,
@@ -1660,11 +1800,21 @@ class CodingSession:
                     session_event_4 = AutoRetryEndEvent(success=True, attempt=1, final_error=None)
                     await self._extension_runtime.emit_event(session_event_4)
                     yield session_event_4
+                async for continuation_event in self._run_queued_continuations(context=context):
+                    yield continuation_event
+                self._operation_active = False
                 session_event_5 = AgentSettledEvent()
                 await self._extension_runtime.emit_event(session_event_5)
                 yield session_event_5
                 return
-            await self._try_auto_compact(context=context, phase="auto_compact_after_prompt")
+            async for compaction_event in self._try_auto_compact(
+                context=context,
+                phase="auto_compact_after_prompt",
+            ):
+                yield compaction_event
+            async for continuation_event in self._run_queued_continuations(context=context):
+                yield continuation_event
+            self._operation_active = False
             session_event_5 = AgentSettledEvent()
             await self._extension_runtime.emit_event(session_event_5)
             yield session_event_5
@@ -1677,11 +1827,45 @@ class CodingSession:
             raise
 
     async def continue_(self) -> AsyncIterator[CodingSessionEvent]:
-        """Continue the agent from restored state and persist new messages."""
+        """Continue the agent from restored state as one serialized operation."""
+        if self._operation_active or self.is_compacting:
+            raise RuntimeError("CodingSession is already running")
+        self._operation_active = True
+        try:
+            async for event in self._continue_operation():
+                yield event
+        finally:
+            self._operation_active = False
+
+    async def _continue_operation(self) -> AsyncIterator[CodingSessionEvent]:
         context = self._diagnostic_context()
         await self._refresh_runtime_model_limits()
-        persisted_count = len(self._harness.messages)
         try:
+            async for event in self._run_queued_continuations(context=context, force_first=True):
+                yield event
+            self._operation_active = False
+            settled = AgentSettledEvent()
+            await self._extension_runtime.emit_event(settled)
+            yield settled
+        except Exception as exc:
+            self._last_diagnostic_log_path = self._diagnostic_logger.log_exception(
+                context=context,
+                phase="agent_loop",
+                exc=exc,
+            )
+            raise
+
+    async def _run_queued_continuations(
+        self,
+        *,
+        context: AgentCallDiagnosticContext,
+        force_first: bool = False,
+    ) -> AsyncIterator[CodingSessionEvent]:
+        """Drain messages queued at terminal agent events before settling."""
+        should_continue = force_first
+        while should_continue or self._harness.has_queued_messages():
+            should_continue = False
+            persisted_count = len(self._harness.messages)
             events = self._harness.continue_()
             self._invalidate_context_usage_cache()
             async for event in events:
@@ -1696,7 +1880,7 @@ class CodingSession:
                 ):
                     self._last_diagnostic_log_path = self._diagnostic_logger.log_assistant_error(
                         context=context,
-                        phase="agent_loop",
+                        phase="agent_loop_continuation",
                         message=event.message,
                     )
                 if isinstance(event, AgentEndEvent):
@@ -1704,17 +1888,11 @@ class CodingSession:
                 else:
                     yield event
             await self._persist_messages_since(persisted_count)
-            await self._try_auto_compact(context=context, phase="auto_compact_after_continue")
-            session_event_5 = AgentSettledEvent()
-            await self._extension_runtime.emit_event(session_event_5)
-            yield session_event_5
-        except Exception as exc:
-            self._last_diagnostic_log_path = self._diagnostic_logger.log_exception(
+            async for compaction_event in self._try_auto_compact(
                 context=context,
-                phase="agent_loop",
-                exc=exc,
-            )
-            raise
+                phase="auto_compact_after_continue",
+            ):
+                yield compaction_event
 
     def _diagnostic_context(self) -> AgentCallDiagnosticContext:
         return AgentCallDiagnosticContext(
@@ -1844,16 +2022,61 @@ class CodingSession:
         *,
         context: AgentCallDiagnosticContext,
         phase: str,
-    ) -> bool:
+    ) -> AsyncIterator[CompactionStartEvent | CompactionEndEvent]:
+        plan = self._auto_compaction_plan()
+        if plan is None:
+            return
+
+        self._compaction_reason = "threshold"
         try:
-            return await self._maybe_auto_compact()
-        except Exception as exc:  # noqa: BLE001 - automatic compaction must not lose a turn
-            self._last_diagnostic_log_path = self._diagnostic_logger.log_exception(
-                context=context,
-                phase=phase,
-                exc=exc,
-            )
-            return False
+            start_event = CompactionStartEvent(reason="threshold")
+            await self._extension_runtime.emit_event(start_event)
+            yield start_event
+
+            self._compaction_cancel_requested = False
+            task = asyncio.create_task(self._execute_compaction_plan(plan))
+            self._compaction_task = task
+            try:
+                result = await task
+            except asyncio.CancelledError:
+                if not self._compaction_cancel_requested:
+                    raise
+                end_event = CompactionEndEvent(
+                    reason="threshold",
+                    result=None,
+                    aborted=True,
+                    will_retry=False,
+                    error_message=None,
+                )
+            except Exception as exc:  # noqa: BLE001 - preserve the pending agent turn
+                self._last_diagnostic_log_path = self._diagnostic_logger.log_exception(
+                    context=context,
+                    phase=phase,
+                    exc=exc,
+                )
+                end_event = CompactionEndEvent(
+                    reason="threshold",
+                    result=None,
+                    aborted=False,
+                    will_retry=False,
+                    error_message=str(exc),
+                )
+            else:
+                end_event = CompactionEndEvent(
+                    reason="threshold",
+                    result=result,
+                    aborted=False,
+                    will_retry=False,
+                    error_message=None,
+                )
+            finally:
+                self._compaction_task = None
+
+            await self._extension_runtime.emit_event(end_event)
+            yield end_event
+        finally:
+            self._compaction_cancel_requested = False
+            self._compaction_reason = None
 
     async def _try_overflow_compact(
         self,
@@ -1864,9 +2087,13 @@ class CodingSession:
             plan = self._recent_preserving_compaction_plan()
             if plan is None:
                 return False
-            summary = await self._generate_compaction_summary(plan.messages_to_summarize)
-            await self._append_compaction(summary, replace_entry_ids=plan.replace_entry_ids)
+            self._compaction_cancel_requested = False
+            task = asyncio.create_task(self._execute_compaction_plan(plan))
+            self._compaction_task = task
+            await task
             return True
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:  # noqa: BLE001 - the original overflow remains visible
             self._last_diagnostic_log_path = self._diagnostic_logger.log_exception(
                 context=context,
@@ -1874,6 +2101,8 @@ class CodingSession:
                 exc=exc,
             )
             return False
+        finally:
+            self._compaction_task = None
 
     async def _try_auto_name_session(
         self,
@@ -1958,20 +2187,30 @@ class CodingSession:
             if self._provider_is_usable(provider)
         )
 
-    async def _maybe_auto_compact(self) -> bool:
+    def _auto_compaction_plan(self) -> CompactionPlan | None:
         threshold = self.auto_compact_token_threshold
         if threshold is None or threshold <= 0:
-            return False
+            return None
         if len(self._state.context_entry_ids) < 2:
-            return False
+            return None
         if self.context_token_estimate <= threshold:
-            return False
-        plan = self._recent_preserving_compaction_plan()
-        if plan is None:
-            return False
-        summary = await self._generate_compaction_summary(plan.messages_to_summarize)
-        await self._append_compaction(summary, replace_entry_ids=plan.replace_entry_ids)
-        return True
+            return None
+        return self._recent_preserving_compaction_plan()
+
+    async def _execute_compaction_plan(
+        self,
+        plan: CompactionPlan,
+        *,
+        custom_instructions: str | None = None,
+    ) -> CompactionEntry:
+        summary = await self._generate_compaction_summary(
+            plan.messages_to_summarize,
+            custom_instructions=custom_instructions,
+        )
+        return await self._append_compaction(
+            summary,
+            replace_entry_ids=plan.replace_entry_ids,
+        )
 
     async def _generate_compaction_summary(
         self,

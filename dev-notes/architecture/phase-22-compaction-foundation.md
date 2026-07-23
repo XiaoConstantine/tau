@@ -14,6 +14,9 @@ src/tau_agent/session/memory.py
 src/tau_coding/context_window.py
 src/tau_coding/session.py
 src/tau_coding/commands.py
+src/tau_coding/events.py
+src/tau_coding/tui/adapter.py
+src/tau_coding/tui/app.py
 ```
 
 ## What was added
@@ -88,6 +91,33 @@ appends a `CompactionEntry`, and rebuilds the in-memory transcript. Tau also
 attempts one compact-and-retry cycle after provider errors that look like
 context overflow.
 
+## Automatic Compaction Lifecycle
+
+Threshold compaction emits `CompactionStartEvent(reason="threshold")` before the
+summary request and a matching `CompactionEndEvent` after success or failure.
+The end event carries the appended compaction entry on success and an error
+message on failure. This keeps provider/session policy in `tau_coding.session`
+while allowing event consumers to present progress without knowing how summaries
+are generated.
+
+The Textual adapter projects this lifecycle as dedicated compaction state. It
+shows an `Auto-compacting…` status row, treats the prompt worker as busy even
+before `AgentStartEvent`, and rebuilds the transcript from `session.messages`
+after compaction. Submissions during that pre-agent window enter a dedicated
+queue without optimistic transcript cards. When the original run starts, Tau
+transfers queued steering and follow-up messages to the active harness; after
+post-turn compaction, it starts the first queued prompt only after the owning
+worker settles.
+
+`CodingSession.is_running` spans the complete serialized operation: input hooks,
+pre-prompt compaction, the harness run, post-run compaction, and continuations
+queued by `agent_end` handlers. Session replacement and provider/model mutation
+are rejected across this boundary, preventing a stale compaction plan from
+being appended after resume. Explicit compaction cancellation uses a child task,
+emits a matching aborted `CompactionEndEvent`, and lets a pre-prompt operation
+continue. Cancelling the whole prompt instead drains both TUI- and harness-owned
+queues back into the editor and reloads durable transcript state.
+
 ## Manual Compaction
 
 Tau now supports model-generated manual compaction in the TUI:
@@ -137,3 +167,13 @@ The tests verify:
 - opt-in automatic compaction runs before prompts and after responses when the
   threshold is exceeded
 - overflow-triggered compaction retries the provider call once when possible
+- threshold compaction emits start/end events around pre-prompt and post-turn work
+- the TUI displays automatic-compaction status and reloads the compacted transcript
+- submissions cannot replace a prompt worker before its first `AgentStartEvent`
+- compaction-time steering and follow-ups retain their queue mode and avoid
+  optimistic transcript cards
+- failed compaction preserves queued input, while prompt cancellation restores it to the editor
+- explicit compaction cancellation emits a terminal aborted event and preserves the owning turn
+- session-changing operations cannot race pre-prompt or post-turn compaction
+- messages queued by `agent_end` handlers continue before the single settled event
+- terminal commands remain local and prompt resources retain prompt queue semantics

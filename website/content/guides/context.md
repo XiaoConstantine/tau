@@ -42,8 +42,13 @@ model's context window. It checks three moments:
 - after a context-overflow error (compact and retry once).
 
 When it compacts, Tau asks the model to summarize older messages, keeps a recent
-suffix of the conversation, and continues. The original session file is never
-edited — only the *active context* sent to the provider changes.
+suffix of the conversation, and continues. The TUI shows `Auto-compacting…`,
+then reloads the transcript from the compacted active context so the summary is
+visible. The prompt remains editable, and submissions made during compaction are
+shown in the pending-message area rather than starting a competing turn. Tau
+preserves whether each message is steering or a follow-up and delivers it after
+compaction. The original session file is never edited — only the *active
+context* sent to the provider changes.
 
 The default threshold follows the model's context window minus a reserve. Providers
 that advertise an explicit runtime threshold can override that default. In particular,
@@ -55,8 +60,9 @@ You can override the resulting threshold for a run:
 tau --auto-compact-threshold 100000
 ```
 
-Automatic compaction is best-effort: if summarization fails, Tau logs it, keeps
-the original context, and carries on.
+Automatic compaction is best-effort: if summarization fails, Tau logs and shows
+the failure, restores the original active transcript, and carries on with the
+turn.
 
 ## Manual compaction
 

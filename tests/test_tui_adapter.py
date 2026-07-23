@@ -17,7 +17,12 @@ from tau_agent import (
     UserMessage,
 )
 from tau_agent.provider_events import TextDeltaEvent, ThinkingDeltaEvent
-from tau_coding.events import AutoRetryStartEvent, QueueUpdateEvent
+from tau_coding.events import (
+    AutoRetryStartEvent,
+    CompactionEndEvent,
+    CompactionStartEvent,
+    QueueUpdateEvent,
+)
 from tau_coding.skills import Skill, format_skill_invocation
 from tau_coding.tui import TuiEventAdapter, TuiState
 from tau_coding.tui.state import format_tool_call_block, format_tool_result_block
@@ -36,6 +41,21 @@ def test_tui_adapter_tracks_running_state() -> None:
 
     adapter.apply(AgentEndEvent())
     assert state.running is False
+
+
+def test_tui_adapter_tracks_compaction_lifecycle() -> None:
+    state = TuiState()
+    adapter = TuiEventAdapter(state)
+
+    adapter.apply(CompactionStartEvent(reason="threshold"))
+
+    assert state.compaction_reason == "threshold"
+    assert [(item.role, item.text) for item in state.items] == [("status", "Auto-compacting…")]
+
+    adapter.apply(CompactionEndEvent(reason="threshold", error_message="summary provider failed"))
+
+    assert state.compaction_reason is None
+    assert state.error == "Auto-compaction failed: summary provider failed"
 
 
 def test_tui_adapter_builds_assistant_item_from_nested_stream_events() -> None:

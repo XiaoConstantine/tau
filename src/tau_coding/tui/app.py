@@ -54,6 +54,7 @@ from tau_agent.messages import (
     TextContent,
     ThinkingContent,
     UserMessage,
+    message_text,
 )
 from tau_agent.provider import CancellationToken
 from tau_agent.provider_events import (
@@ -76,6 +77,8 @@ from tau_coding.events import (
     AgentSettledEvent,
     AutoRetryStartEvent,
     CodingSessionEvent,
+    CompactionEndEvent,
+    CompactionStartEvent,
     QueueUpdateEvent,
 )
 from tau_coding.extensions.api import (
@@ -175,6 +178,16 @@ COMPLETION_INITIAL_TERMINAL_FRACTION = 3
 COMPLETION_MIN_TRANSCRIPT_LINES = 4
 COMPLETION_WIDGET_CHROME_LINES = 3
 PROMPT_PLACEHOLDER = "Ask Tau…  Enter submits, Shift+Enter inserts a newline"
+
+
+@dataclass(frozen=True, slots=True)
+class _CompactionQueuedPrompt:
+    """Prompt entered while a worker is preparing or compacting."""
+
+    text: str
+    streaming_behavior: Literal["steer", "follow_up"]
+
+
 NO_STORED_CREDENTIALS_MESSAGE = (
     "No stored credentials to remove. /logout only removes credentials saved by /login; "
     "environment variables and providers.json config are unchanged."
@@ -3379,6 +3392,7 @@ class TauTuiApp(App[None]):
                 f"using {self.tui_settings.resolved_theme.name}.",
             )
         self._prompt_history: tuple[str, ...] = ()
+        self._compaction_queued_prompts: list[_CompactionQueuedPrompt] = []
         self._load_session_messages_from_session()
         self.adapter = TuiEventAdapter(self.state)
         # Component seam: host-owned tracking of extension
@@ -3403,6 +3417,7 @@ class TauTuiApp(App[None]):
         self._connect_extension_runtime(session)
         self._prompt_worker: Worker[None] | None = None
         self._compaction_worker: Worker[None] | None = None
+        self._queued_prompt_in_flight: _CompactionQueuedPrompt | None = None
         self._prompt_run_id = 0
         self._optimistic_user_messages: list[tuple[int, str]] = []
         self._completion_state = CompletionState()
@@ -3429,14 +3444,15 @@ class TauTuiApp(App[None]):
         """Reflect the active session name and running state in the terminal tab title."""
         self._terminal_title.update(
             getattr(self.session, "session_title", None),
-            running=self.state.running,
+            running=self.state.running or self.state.compaction_reason is not None,
             frame=self._activity_frame,
         )
 
     def _sync_text_selection_state(self) -> None:
         """Disable native text selection while the transcript is mutating."""
-        type(self).ALLOW_SELECT = not self.state.running
-        if self.state.running and self.screen_stack:
+        busy = self.state.running or self.state.compaction_reason is not None
+        type(self).ALLOW_SELECT = not busy
+        if busy and self.screen_stack:
             with suppress(Exception):
                 self.screen.clear_selection()
 
@@ -3657,15 +3673,46 @@ class TauTuiApp(App[None]):
             self._refresh_completions()
             return
 
+        terminal_command = parse_terminal_command(text)
+        is_prompt_resource = _is_prompt_resource_submission(self.session, text)
+
         if self._is_compaction_active():
-            if text.startswith("/compact"):
-                self._notify("A compaction is already running.", severity="warning")
+            if terminal_command is not None or (text.startswith("/") and not is_prompt_resource):
+                prompt.text = raw_text
+                prompt.move_cursor(_text_end_location(raw_text))
+                if terminal_command is not None:
+                    message = "Wait for compaction to finish before running terminal commands."
+                elif text.startswith("/compact"):
+                    message = "A compaction is already running."
+                else:
+                    message = (
+                        "Compaction is still running. "
+                        "Wait for it to finish before running commands."
+                    )
+                self._notify(message, severity="warning")
             else:
+                self._queue_compaction_prompt(
+                    text,
+                    streaming_behavior=streaming_behavior,
+                    prompt=prompt,
+                    status="Queued message for after compaction",
+                )
+            return
+
+        if self._is_prompt_worker_active() and not self.state.running:
+            if terminal_command is not None or (text.startswith("/") and not is_prompt_resource):
                 prompt.text = raw_text
                 prompt.move_cursor(_text_end_location(raw_text))
                 self._notify(
-                    "Compaction is still running. You can keep editing, but wait to submit.",
+                    "The current turn is still starting. Wait before running commands.",
                     severity="warning",
+                )
+            else:
+                self._queue_compaction_prompt(
+                    text,
+                    streaming_behavior=streaming_behavior,
+                    prompt=prompt,
+                    status="Queued message for the current turn",
                 )
             return
 
@@ -3674,7 +3721,6 @@ class TauTuiApp(App[None]):
         self._completion_state = CompletionState()
         self._refresh_completions()
 
-        terminal_command = parse_terminal_command(text)
         if terminal_command is not None:
             self.run_worker(
                 self._run_terminal_command(
@@ -3788,30 +3834,126 @@ class TauTuiApp(App[None]):
             return
         self._prompt_history = (*self._prompt_history, text)
 
+    def _queue_compaction_prompt(
+        self,
+        text: str,
+        *,
+        streaming_behavior: Literal["steer", "follow_up"],
+        prompt: PromptInput,
+        status: str,
+    ) -> None:
+        """Queue input without creating a competing worker or transcript card."""
+        self._compaction_queued_prompts.append(
+            _CompactionQueuedPrompt(text=text, streaming_behavior=streaming_behavior)
+        )
+        self._remember_prompt(text)
+        prompt.text = ""
+        prompt._clear_pending_paste()
+        self._completion_state = CompletionState()
+        self._refresh_completions()
+        self._refresh_chrome()
+        self._notify(status)
+
+    async def _flush_compaction_queue_to_active_run(self) -> None:
+        """Transfer compaction-time input once the harness is actively running."""
+        if not self._compaction_queued_prompts:
+            return
+        queued = list(self._compaction_queued_prompts)
+        self._compaction_queued_prompts.clear()
+        self._refresh_chrome()
+        for index, message in enumerate(queued):
+            accepted = await self._queue_prompt(
+                message.text,
+                streaming_behavior=message.streaming_behavior,
+            )
+            if accepted:
+                continue
+            self._compaction_queued_prompts[0:0] = queued[index:]
+            self._restore_compaction_queue_to_editor()
+            return
+
+    async def _start_next_compaction_queued_prompt(self) -> None:
+        """Start queued input after post-turn compaction has fully settled."""
+        if not self._compaction_queued_prompts:
+            return
+        if self._is_compaction_active() or self._is_prompt_worker_active():
+            return
+        if bool(getattr(self.session, "is_running", False)):
+            return
+        message = self._compaction_queued_prompts.pop(0)
+        self._refresh_chrome()
+        await self._submit_prompt(
+            message.text,
+            optimistic=False,
+            queued_origin=message,
+        )
+
+    def _drain_session_queue_to_local(self) -> None:
+        """Move harness-owned queued input back under TUI ownership."""
+        clear_queue = getattr(self.session, "clear_queued_messages", None)
+        if not callable(clear_queue):
+            return
+        queued = clear_queue()
+        for message in queued.steering:
+            self._compaction_queued_prompts.append(
+                _CompactionQueuedPrompt(
+                    text=message_text(message),
+                    streaming_behavior="steer",
+                )
+            )
+        for message in queued.follow_up:
+            self._compaction_queued_prompts.append(
+                _CompactionQueuedPrompt(
+                    text=message_text(message),
+                    streaming_behavior="follow_up",
+                )
+            )
+
+    def _restore_compaction_queue_to_editor(self) -> None:
+        """Return unsent compaction-time input to the editor after cancellation."""
+        if not self._compaction_queued_prompts or not self.screen_stack:
+            return
+        prompt = self.query_one("#prompt", PromptInput)
+        queued_text = "\n\n".join(message.text for message in self._compaction_queued_prompts)
+        current_text = prompt.text
+        prompt.text = "\n\n".join(part for part in (queued_text, current_text) if part.strip())
+        prompt.move_cursor(_text_end_location(prompt.text))
+        self._compaction_queued_prompts.clear()
+        self._refresh_chrome()
+
     def _load_session_messages_from_session(self) -> None:
         """Load visible session messages and reseed prompt history from them."""
         self.state.load_messages(self.session.messages)
-        self._prompt_history = tuple(
+        persisted_history = tuple(
             message.text
             for message in self.session.messages
             if isinstance(message, UserMessage) and message.text.strip()
         )
+        queued_history = tuple(message.text for message in self._compaction_queued_prompts)
+        self._prompt_history = (*persisted_history, *queued_history)
 
     def _is_compaction_active(self) -> bool:
-        """Return whether a manual compaction worker is still running."""
+        """Return whether manual or session-managed compaction is running."""
+        if self.state.compaction_reason is not None:
+            return True
+        if bool(getattr(self.session, "is_compacting", False)):
+            return True
         worker = self._compaction_worker
+        return worker is not None and not worker.is_finished and not worker.is_cancelled
+
+    def _is_prompt_worker_active(self) -> bool:
+        """Return whether the serialized prompt worker has not finished yet."""
+        worker = self._prompt_worker
         return worker is not None and not worker.is_finished and not worker.is_cancelled
 
     def _is_agent_or_queue_active(self) -> bool:
         """Return whether compaction would race an active or queued agent turn."""
         self._sync_queue_state()
-        worker = self._prompt_worker
-        is_worker_active = worker is not None and not worker.is_finished and not worker.is_cancelled
         is_session_running = bool(getattr(self.session, "is_running", False))
         return (
             self.state.running
             or is_session_running
-            or is_worker_active
+            or self._is_prompt_worker_active()
             or self.state.queued_message_count > 0
         )
 
@@ -3823,12 +3965,18 @@ class TauTuiApp(App[None]):
         try:
             compact_message = await self.session.compact(summary)
         except asyncio.CancelledError:
+            self.state.clear()
+            self.state.set_skills(self.session.skills)
+            self._load_session_messages_from_session()
+            self._refresh()
             return
         except Exception as exc:  # noqa: BLE001 - surface command failures in the TUI
             self._notify(f"Error: {exc}", severity="error")
             return
         finally:
             self._compaction_worker = None
+            if self._compaction_queued_prompts:
+                self.call_later(self._start_next_compaction_queued_prompt)
         self.state.clear()
         self.state.set_skills(self.session.skills)
         self._load_session_messages_from_session()
@@ -3842,20 +3990,27 @@ class TauTuiApp(App[None]):
         source: Literal["interactive", "extension"] = "interactive",
         custom_type: str | None = None,
         details: dict[str, JSONValue] | None = None,
+        optimistic: bool = True,
+        queued_origin: _CompactionQueuedPrompt | None = None,
     ) -> None:
         """Add a prompt to the transcript and start the agent worker."""
         self._prompt_run_id += 1
         run_id = self._prompt_run_id
-        # Custom messages are never rendered optimistically: the optimistic
-        # dedupe matches on exact content equality with the post-expansion
-        # event (see _consume_optimistic_user_event), and a mismatch would
-        # double-render. They render once, from the confirmed user event,
-        # which carries their custom_type/details.
-        if custom_type is None and _should_optimistically_render_prompt(text):
+        # Custom messages and compaction-queued prompts are never rendered
+        # optimistically. They render once from their confirmed user event.
+        if optimistic and custom_type is None and _should_optimistically_render_prompt(text):
             self._optimistic_user_messages.append((run_id, text))
             await self._append_optimistic_user_message(text)
+        self._queued_prompt_in_flight = queued_origin
         self._prompt_worker = self.run_worker(
-            self._run_prompt(text, run_id, source=source, custom_type=custom_type, details=details),
+            self._run_prompt(
+                text,
+                run_id,
+                source=source,
+                custom_type=custom_type,
+                details=details,
+                queued_origin=queued_origin,
+            ),
             exclusive=True,
         )
 
@@ -4497,15 +4652,16 @@ class TauTuiApp(App[None]):
         text: str,
         *,
         streaming_behavior: Literal["steer", "follow_up"],
-    ) -> None:
+    ) -> bool:
         """Queue a prompt for the active agent worker."""
         try:
             async for event in self.session.prompt(text, streaming_behavior=streaming_behavior):
                 self.adapter.apply(event)
         except Exception as exc:  # noqa: BLE001 - surface queueing failures in the TUI
             self._notify(f"Could not queue message: {exc}", severity="error")
-            return
+            return False
         self._refresh_chrome()
+        return True
 
     async def _run_prompt(
         self,
@@ -4515,15 +4671,21 @@ class TauTuiApp(App[None]):
         source: Literal["interactive", "extension"] = "interactive",
         custom_type: str | None = None,
         details: dict[str, JSONValue] | None = None,
+        queued_origin: _CompactionQueuedPrompt | None = None,
     ) -> None:
         """Run one prompt and stream session events into the TUI state."""
         active_run_id = self._prompt_run_id if run_id is None else run_id
+        agent_started = False
+        queued_origin_restored = False
         try:
             async for event in self.session.prompt(
                 text, source=source, custom_type=custom_type, details=details
             ):
                 if active_run_id != self._prompt_run_id:
                     return
+                if isinstance(event, AgentStartEvent):
+                    agent_started = True
+                    self._queued_prompt_in_flight = None
                 if self._consume_optimistic_user_event(event, run_id=active_run_id):
                     self._sync_text_selection_state()
                     self._refresh_chrome()
@@ -4544,9 +4706,23 @@ class TauTuiApp(App[None]):
                 await self._apply_streaming_transcript_event(event)
                 if isinstance(event, AgentSettledEvent) and not self._app_has_focus:
                     self._terminal_notification.notify_turn_finished()
+        except asyncio.CancelledError:
+            if (
+                queued_origin is not None
+                and not agent_started
+                and active_run_id == self._prompt_run_id
+            ):
+                self._compaction_queued_prompts.insert(0, queued_origin)
+                self._queued_prompt_in_flight = None
+                queued_origin_restored = True
+            raise
         except Exception as exc:  # noqa: BLE001 - surface unexpected worker errors in the TUI
             if active_run_id != self._prompt_run_id:
                 return
+            if queued_origin is not None and not agent_started:
+                self._compaction_queued_prompts.insert(0, queued_origin)
+                self._queued_prompt_in_flight = None
+                queued_origin_restored = True
             message = _format_prompt_error(exc, self.session)
             self.state.error = message
             self.state.add_item("error", message)
@@ -4557,6 +4733,9 @@ class TauTuiApp(App[None]):
             self._clear_optimistic_user_messages(run_id=active_run_id)
             if active_run_id == self._prompt_run_id:
                 self._prompt_worker = None
+                self._queued_prompt_in_flight = None
+                if self._compaction_queued_prompts and not queued_origin_restored:
+                    self.call_later(self._start_next_compaction_queued_prompt)
 
     async def _apply_streaming_transcript_event(self, event: CodingSessionEvent) -> None:
         """Apply an agent event to mounted transcript widgets without full redraws."""
@@ -4569,7 +4748,34 @@ class TauTuiApp(App[None]):
         except NoMatches:
             self._refresh()
             return
+        if isinstance(event, CompactionStartEvent):
+            if self.state.items:
+                await transcript.append_item(
+                    self.state.items[-1],
+                    theme=theme,
+                    show_tool_results=self.state.show_tool_results,
+                )
+            self._refresh_chrome()
+            return
+        if isinstance(event, CompactionEndEvent):
+            self._clear_optimistic_user_messages(run_id=self._prompt_run_id)
+            self.state.clear()
+            self.state.set_skills(self.session.skills)
+            self._load_session_messages_from_session()
+            if event.aborted:
+                self._notify(
+                    "Compaction cancelled"
+                    if event.reason == "manual"
+                    else "Auto-compaction cancelled"
+                )
+            elif event.error_message:
+                error_message = f"Auto-compaction failed: {event.error_message}"
+                self.state.error = error_message
+                self._notify(error_message, severity="error")
+            self._refresh()
+            return
         if isinstance(event, AgentStartEvent):
+            await self._flush_compaction_queue_to_active_run()
             self._refresh_chrome()
             return
         if isinstance(event, AgentEndEvent):
@@ -4692,7 +4898,20 @@ class TauTuiApp(App[None]):
         self._cancel_active_prompt(notify=True)
 
     def _cancel_active_compaction(self, *, notify: bool) -> bool:
-        """Cancel the active manual compaction worker and restore visible session state."""
+        """Cancel active compaction without cancelling its owning prompt."""
+        if self._is_compaction_active():
+            abort = getattr(self.session, "abort_compaction", None)
+            if callable(abort) and abort():
+                if notify and self._compaction_worker is not None:
+                    self._notify("Cancelled compaction.")
+                return True
+            if self.state.compaction_reason is not None:
+                self._cancel_active_prompt(notify=False)
+                self._restore_compaction_queue_to_editor()
+                if notify:
+                    self._notify("Cancelled compaction.")
+                return True
+
         worker = self._compaction_worker
         if worker is None or worker.is_finished or worker.is_cancelled:
             return False
@@ -4702,6 +4921,7 @@ class TauTuiApp(App[None]):
         self.state.clear()
         self.state.set_skills(self.session.skills)
         self._load_session_messages_from_session()
+        self._restore_compaction_queue_to_editor()
         self._refresh()
         if notify:
             self._notify("Cancelled compaction.")
@@ -4713,10 +4933,15 @@ class TauTuiApp(App[None]):
         worker = self._prompt_worker
         is_worker_active = worker is not None and not worker.is_cancelled
         is_session_running = bool(getattr(self.session, "is_running", False))
-        if not (self.state.running or is_session_running or is_worker_active):
+        was_compacting = self.state.compaction_reason is not None
+        if not (self.state.running or is_session_running or is_worker_active or was_compacting):
             return
 
         self._prompt_run_id += 1
+        if self._queued_prompt_in_flight is not None:
+            self._compaction_queued_prompts.insert(0, self._queued_prompt_in_flight)
+            self._queued_prompt_in_flight = None
+        self._drain_session_queue_to_local()
         cancel = getattr(self.session, "cancel", None)
         if callable(cancel):
             cancel()
@@ -4724,7 +4949,12 @@ class TauTuiApp(App[None]):
             worker.cancel()
         self._prompt_worker = None
         self.state.running = False
+        self.state.compaction_reason = None
         self.state.assistant_buffer = ""
+        self.state.clear()
+        self.state.set_skills(self.session.skills)
+        self._load_session_messages_from_session()
+        self._restore_compaction_queue_to_editor()
         self._sync_text_selection_state()
         self._refresh()
         if notify:
@@ -4835,7 +5065,11 @@ class TauTuiApp(App[None]):
 
     def action_edit_queued_message(self) -> bool:
         """Move the latest queued message back into the prompt for editing."""
-        if not self.state.running:
+        if not (
+            self.state.running
+            or self.state.compaction_reason is not None
+            or self._is_prompt_worker_active()
+        ):
             return False
         prompt = self.query_one("#prompt", PromptInput)
         if prompt.text.strip():
@@ -4856,7 +5090,14 @@ class TauTuiApp(App[None]):
         return self.action_edit_queued_message()
 
     def _pop_latest_queued_message(self) -> str | None:
-        """Pop the latest queued follow-up or steering message from the session."""
+        """Pop the latest queued follow-up or steering message."""
+        for mode in ("follow_up", "steer"):
+            for index in range(len(self._compaction_queued_prompts) - 1, -1, -1):
+                message = self._compaction_queued_prompts[index]
+                if message.streaming_behavior == mode:
+                    self._compaction_queued_prompts.pop(index)
+                    return message.text
+
         pop_follow_up = getattr(self.session, "pop_latest_follow_up_message", None)
         if callable(pop_follow_up):
             message = pop_follow_up()
@@ -4882,7 +5123,7 @@ class TauTuiApp(App[None]):
 
     def action_open_session_picker(self) -> None:
         """Open the indexed session picker."""
-        if self.state.running:
+        if self._is_agent_or_queue_active() or self._is_compaction_active():
             self._notify("Tau is already working. Press Escape to cancel.")
             return
         records = _session_records(self.session)
@@ -4940,7 +5181,7 @@ class TauTuiApp(App[None]):
 
     def action_cycle_model(self) -> None:
         """Cycle through scoped models."""
-        if self.state.running:
+        if self._is_agent_or_queue_active() or self._is_compaction_active():
             self._notify("Tau is already working. Press Escape to cancel.")
             return
         self.run_worker(self._cycle_scoped_model(), exclusive=False)
@@ -4969,6 +5210,9 @@ class TauTuiApp(App[None]):
 
     def _handle_session_picker_result(self, session_id: str | None) -> None:
         if session_id is None:
+            return
+        if self._is_agent_or_queue_active() or self._is_compaction_active():
+            self._notify("Tau is already working. Press Escape to cancel.")
             return
         self.run_worker(self._resume_session(session_id), exclusive=False)
 
@@ -5548,13 +5792,32 @@ class TauTuiApp(App[None]):
 
     def _sync_queue_state(self) -> None:
         queue_event = getattr(self.session, "queue_update_event", None)
-        if not callable(queue_event):
-            return
-        self.adapter.apply(queue_event())
+        if callable(queue_event):
+            self.adapter.apply(queue_event())
+            steering = self.state.queued_steering
+            follow_up = self.state.queued_follow_up
+        else:
+            steering = ()
+            follow_up = ()
+        compaction_steering = tuple(
+            message.text
+            for message in self._compaction_queued_prompts
+            if message.streaming_behavior == "steer"
+        )
+        compaction_follow_up = tuple(
+            message.text
+            for message in self._compaction_queued_prompts
+            if message.streaming_behavior == "follow_up"
+        )
+        self.state.update_queue(
+            steering=(*steering, *compaction_steering),
+            follow_up=(*follow_up, *compaction_follow_up),
+        )
 
     def _sync_activity_indicator(self) -> None:
         self._sync_terminal_title()
-        if self.state.running:
+        busy = self.state.running or self.state.compaction_reason is not None
+        if busy:
             if self._activity_timer is None:
                 self._activity_timer = self.set_interval(
                     ACTIVITY_TICK_SECONDS,
@@ -5571,7 +5834,7 @@ class TauTuiApp(App[None]):
         self._apply_activity_indicator()
 
     def _tick_activity(self) -> None:
-        if not self.state.running:
+        if not (self.state.running or self.state.compaction_reason is not None):
             return
         self._activity_frame += 1
         self._apply_activity_indicator()
@@ -5616,13 +5879,14 @@ class TauTuiApp(App[None]):
         except NoMatches:
             return
         shell_mode = _is_terminal_command_prompt(prompt.text)
+        busy = self.state.running or self.state.compaction_reason is not None
         render_key = (
             theme.name,
             theme.accent,
             theme.screen_background,
             theme.prompt_border,
             self._activity_frame,
-            self.state.running,
+            busy,
             shell_mode,
         )
         if render_key == self._last_activity_indicator_key:
@@ -5633,7 +5897,7 @@ class TauTuiApp(App[None]):
             _activity_prompt_border_color(
                 theme,
                 frame=self._activity_frame,
-                running=self.state.running,
+                running=busy,
                 shell_mode=shell_mode,
             ),
         )
@@ -5641,7 +5905,7 @@ class TauTuiApp(App[None]):
             _render_activity_indicator(
                 theme,
                 frame=self._activity_frame,
-                running=self.state.running,
+                running=busy,
             ),
             layout=False,
         )
@@ -5812,6 +6076,19 @@ def _render_activity_indicator(theme: TuiTheme, *, frame: int, running: bool) ->
 def _is_terminal_command_prompt(text: str) -> bool:
     """Return whether the prompt is currently in terminal-command mode."""
     return _terminal_command_prefix_span(text) is not None
+
+
+def _is_prompt_resource_submission(session: object, text: str) -> bool:
+    """Return whether slash-prefixed text expands to a skill or prompt resource."""
+    if not text.startswith("/"):
+        return False
+    expand = getattr(session, "expand_prompt_text", None)
+    if not callable(expand):
+        return text.startswith("/skill:")
+    try:
+        return text.startswith("/skill:") or bool(expand(text) != text)
+    except Exception:  # noqa: BLE001 - the real prompt path reports expansion failures
+        return text.startswith("/skill:")
 
 
 def _should_optimistically_render_prompt(text: str) -> bool:
@@ -6276,7 +6553,7 @@ def _prompt_footer_mode(
 ) -> Literal["normal", "completion", "running"]:
     if completion_state.items:
         return "completion"
-    if state.running:
+    if state.running or state.compaction_reason is not None:
         return "running"
     return "normal"
 

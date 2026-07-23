@@ -12,7 +12,13 @@ from tau_agent.events import (
 )
 from tau_agent.messages import AssistantMessage, CustomMessage, ToolCall, UserMessage
 from tau_ai.events import TextDeltaEvent, ThinkingDeltaEvent
-from tau_coding.events import AutoRetryStartEvent, CodingSessionEvent, QueueUpdateEvent
+from tau_coding.events import (
+    AutoRetryStartEvent,
+    CodingSessionEvent,
+    CompactionEndEvent,
+    CompactionStartEvent,
+    QueueUpdateEvent,
+)
 from tau_coding.tui.state import TuiState
 
 
@@ -36,6 +42,21 @@ class TuiEventAdapter:
             return
         if isinstance(event, QueueUpdateEvent):
             self.state.update_queue(steering=event.steering, follow_up=event.follow_up)
+            return
+        if isinstance(event, CompactionStartEvent):
+            self.state.compaction_reason = event.reason
+            if event.reason == "manual":
+                label = "Compacting context…"
+            elif event.reason == "overflow":
+                label = "Context overflow detected; auto-compacting…"
+            else:
+                label = "Auto-compacting…"
+            self.state.add_item("status", label)
+            return
+        if isinstance(event, CompactionEndEvent):
+            self.state.compaction_reason = None
+            if event.error_message:
+                self.state.error = f"Auto-compaction failed: {event.error_message}"
             return
         if isinstance(event, MessageStartEvent):
             if isinstance(event.message, AssistantMessage):

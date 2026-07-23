@@ -9,6 +9,7 @@ import pytest
 from conftest import isolate_home
 from pi_event_helpers import assistant_done, assistant_error, assistant_start
 from tau_agent import (
+    AgentEndEvent,
     AgentMessage,
     AgentTool,
     AssistantMessage,
@@ -51,7 +52,7 @@ from tau_coding import (
     save_provider_settings,
 )
 from tau_coding import session as coding_session_module
-from tau_coding.events import QueueUpdateEvent
+from tau_coding.events import CompactionEndEvent, CompactionStartEvent, QueueUpdateEvent
 from tau_coding.prompt_templates import PromptTemplate
 from tau_coding.session import _ordered_tree_entries, parse_terminal_command
 
@@ -109,6 +110,32 @@ class ModelLimitsFakeProvider(FakeProvider):
         if self.error is not None:
             raise self.error
         return self.limits
+
+
+class BlockingCallFakeProvider(FakeProvider):
+    def __init__(
+        self,
+        scripts: list[list[AssistantMessageEvent]],
+        *,
+        block_call: int,
+    ) -> None:
+        super().__init__(scripts)
+        self.block_call = block_call
+        self.block_started = asyncio.Event()
+        self.release_block = asyncio.Event()
+
+    def stream_response(self, **kwargs: object) -> AsyncIterator[AssistantMessageEvent]:
+        stream = super().stream_response(**kwargs)  # type: ignore[arg-type]
+        call_number = len(self.calls)
+
+        async def iterator() -> AsyncIterator[AssistantMessageEvent]:
+            if call_number == self.block_call:
+                self.block_started.set()
+                await self.release_block.wait()
+            async for event in stream:
+                yield event
+
+        return iterator()
 
 
 class RaisingProvider:
@@ -705,6 +732,48 @@ async def test_prompt_queues_steering_while_session_is_running(tmp_path: Path) -
     assert [entry.message for entry in message_entries] == list(session.messages)
     assert [entry.entry_id for entry in leaf_entries] == [entry.id for entry in message_entries]
     assert not any(isinstance(event, QueueUpdateEvent) for event in run_events)
+
+
+@pytest.mark.anyio
+async def test_prompt_continues_messages_queued_by_agent_end_listener(tmp_path: Path) -> None:
+    provider = FakeProvider(
+        [
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="First answer")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Follow-up answer")),
+            ],
+        ]
+    )
+    session = await CodingSession.load(
+        _config(tmp_path, provider, JsonlSessionStorage(tmp_path / "session.jsonl"))
+    )
+    queued = False
+
+    def queue_from_agent_end(event: object) -> None:
+        nonlocal queued
+        if isinstance(event, AgentEndEvent) and not queued:
+            queued = True
+            session.queue_follow_up_message("Extension follow-up")
+
+    session._harness.subscribe(queue_from_agent_end)
+
+    events = await _collect_session_events(session.prompt("Start"))
+
+    assert [event.type for event in events].count("agent_end") == 2
+    assert [event.type for event in events].count("agent_settled") == 1
+    _assert_messages(
+        session.messages,
+        [
+            UserMessage(content="Start"),
+            AssistantMessage(content="First answer"),
+            UserMessage(content="Extension follow-up"),
+            AssistantMessage(content="Follow-up answer"),
+        ],
+    )
 
 
 @pytest.mark.anyio
@@ -2650,14 +2719,25 @@ async def test_session_auto_compacts_after_response_when_threshold_is_exceeded(
     )
     _first_events = await _collect_session_events(session.prompt(large_prompt))
 
-    _second_events = await _collect_session_events(session.prompt("Continue."))
+    second_events = await _collect_session_events(session.prompt("Continue."))
     _third_events = await _collect_session_events(session.prompt("Next."))
 
     entries = await storage.read_all()
     compactions = [entry for entry in entries if entry.type == "compaction"]
 
+    assert [event.type for event in second_events[-3:]] == [
+        "compaction_start",
+        "compaction_end",
+        "agent_settled",
+    ]
+    assert isinstance(second_events[-3], CompactionStartEvent)
+    assert second_events[-3].reason == "threshold"
+    assert isinstance(second_events[-2], CompactionEndEvent)
+    assert second_events[-2].reason == "threshold"
+    assert second_events[-2].error_message is None
     assert len(compactions) == 1
     assert compactions[0].summary == "Generated automatic summary"
+    assert second_events[-2].result == compactions[0]
     assert "Explain sessions." in provider.calls[2][2][0].content
     _assert_messages(
         provider.calls[3][2],
@@ -2668,6 +2748,259 @@ async def test_session_auto_compacts_after_response_when_threshold_is_exceeded(
             UserMessage(content="Next."),
         ],
     )
+
+
+@pytest.mark.anyio
+async def test_session_auto_compacts_before_prompt_with_lifecycle_events(
+    tmp_path: Path,
+) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    large_prompt = "Explain sessions.\n" + ("old context " * 12_000)
+    provider = FakeProvider(
+        [
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="First answer")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Second answer")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Pre-prompt summary")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Third answer")),
+            ],
+        ]
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="You are Tau.",
+            storage=storage,
+            cwd=tmp_path,
+            auto_compact_token_threshold=1,
+            auto_compact_enabled=False,
+        )
+    )
+    await _collect_session_events(session.prompt(large_prompt))
+    await _collect_session_events(session.prompt("Continue."))
+    session._auto_compact_enabled = True
+
+    stream = session.prompt("Next.")
+    compaction_start = await anext(stream)
+    assert session.is_compacting is True
+    compaction_end = await anext(stream)
+    assert session.is_compacting is True
+    agent_start = await anext(stream)
+    assert session.is_compacting is False
+    events = [compaction_start, compaction_end, agent_start, *[event async for event in stream]]
+
+    assert [event.type for event in events[:3]] == [
+        "compaction_start",
+        "compaction_end",
+        "agent_start",
+    ]
+    assert isinstance(events[0], CompactionStartEvent)
+    assert isinstance(events[1], CompactionEndEvent)
+    assert events[1].error_message is None
+    assert "Explain sessions." in provider.calls[2][2][0].content
+    _assert_messages(
+        provider.calls[3][2],
+        [
+            UserMessage(content="Previous conversation summary:\nPre-prompt summary"),
+            UserMessage(content="Continue."),
+            AssistantMessage(content="Second answer"),
+            UserMessage(content="Next."),
+        ],
+    )
+
+
+@pytest.mark.anyio
+async def test_session_queues_concurrent_prompt_during_pre_prompt_compaction(
+    tmp_path: Path,
+) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    large_prompt = "Explain sessions.\n" + ("old context " * 12_000)
+    provider = BlockingCallFakeProvider(
+        [
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="First answer")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Second answer")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Pre-prompt summary")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Third answer")),
+            ],
+        ],
+        block_call=3,
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="You are Tau.",
+            storage=storage,
+            cwd=tmp_path,
+            auto_compact_token_threshold=1,
+            auto_compact_enabled=False,
+        )
+    )
+    await _collect_session_events(session.prompt(large_prompt))
+    await _collect_session_events(session.prompt("Continue."))
+    session._auto_compact_enabled = True
+
+    prompt_task = asyncio.create_task(_collect_session_events(session.prompt("Next.")))
+    await asyncio.wait_for(provider.block_started.wait(), timeout=1)
+
+    queued_events = await _collect_session_events(
+        session.prompt("Queued guidance", streaming_behavior="steer")
+    )
+
+    assert session.is_running is True
+    assert session.is_compacting is True
+    assert isinstance(queued_events[0], QueueUpdateEvent)
+    assert session.queued_steering_messages == ("Queued guidance",)
+    with pytest.raises(RuntimeError, match="Cannot switch models while Tau is working"):
+        session.set_model("other-model")
+    with pytest.raises(RuntimeError, match="Cannot resume another session while Tau is working"):
+        await session.resume("other-session")
+
+    provider.release_block.set()
+    await asyncio.wait_for(prompt_task, timeout=1)
+
+    assert session.is_running is False
+    assert session.is_compacting is False
+    assert [message.text for message in provider.calls[3][2][-2:]] == [
+        "Next.",
+        "Queued guidance",
+    ]
+
+
+@pytest.mark.anyio
+async def test_session_abort_compaction_emits_terminal_event_and_continues_prompt(
+    tmp_path: Path,
+) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    large_prompt = "Explain sessions.\n" + ("old context " * 12_000)
+    provider = BlockingCallFakeProvider(
+        [
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="First answer")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Second answer")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Unused summary")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Third answer")),
+            ],
+        ],
+        block_call=3,
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="You are Tau.",
+            storage=storage,
+            cwd=tmp_path,
+            auto_compact_token_threshold=1,
+            auto_compact_enabled=False,
+        )
+    )
+    await _collect_session_events(session.prompt(large_prompt))
+    await _collect_session_events(session.prompt("Continue."))
+    session._auto_compact_enabled = True
+
+    prompt_task = asyncio.create_task(_collect_session_events(session.prompt("Next.")))
+    await asyncio.wait_for(provider.block_started.wait(), timeout=1)
+
+    assert session.abort_compaction() is True
+    events = await asyncio.wait_for(prompt_task, timeout=1)
+
+    compaction_events = [
+        event for event in events if isinstance(event, CompactionStartEvent | CompactionEndEvent)
+    ]
+    assert len(compaction_events) >= 2
+    assert isinstance(compaction_events[1], CompactionEndEvent)
+    assert compaction_events[1].aborted is True
+    assert compaction_events[1].error_message is None
+    assert any(
+        getattr(event, "type", None) == "message_end"
+        and getattr(getattr(event, "message", None), "text", None) == "Third answer"
+        for event in events
+    )
+    assert session.is_running is False
+    assert session.is_compacting is False
+
+
+@pytest.mark.anyio
+async def test_session_auto_compaction_failure_emits_end_event_and_preserves_turn(
+    tmp_path: Path,
+) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    large_prompt = "Explain sessions.\n" + ("old context " * 12_000)
+    provider = FakeProvider(
+        [
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="First answer")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Second answer")),
+            ],
+            [assistant_error(message="summary provider failed")],
+        ]
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="You are Tau.",
+            storage=storage,
+            cwd=tmp_path,
+            auto_compact_token_threshold=1,
+        )
+    )
+    await _collect_session_events(session.prompt(large_prompt))
+
+    events = await _collect_session_events(session.prompt("Continue."))
+
+    assert [event.type for event in events[-3:]] == [
+        "compaction_start",
+        "compaction_end",
+        "agent_settled",
+    ]
+    assert isinstance(events[-2], CompactionEndEvent)
+    assert events[-2].result is None
+    assert events[-2].aborted is False
+    assert events[-2].error_message == "Compaction summarization failed: summary provider failed"
+    assert [message.text for message in session.messages if isinstance(message, UserMessage)] == [
+        large_prompt,
+        "Continue.",
+    ]
+    assert [entry for entry in await storage.read_all() if entry.type == "compaction"] == []
+    assert session.last_diagnostic_log_path is not None
 
 
 @pytest.mark.anyio
@@ -2860,6 +3193,47 @@ async def test_session_compacts_and_retries_once_after_context_overflow(
         and entry.message.stop_reason == "error"
     ]
     assert len(overflow_errors) == 1
+
+
+@pytest.mark.anyio
+async def test_overflow_compaction_failure_is_not_reported_as_cancellation(
+    tmp_path: Path,
+) -> None:
+    provider = FakeProvider(
+        [
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="First answer")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Second answer")),
+            ],
+            [assistant_error(message="This model's maximum context length was exceeded.")],
+            [assistant_error(message="summary provider failed")],
+        ]
+    )
+    session = await CodingSession.load(
+        _config(
+            tmp_path,
+            provider,
+            JsonlSessionStorage(tmp_path / "session.jsonl"),
+        )
+    )
+    large_prompt = "Collect context.\n" + ("old context " * 12_000)
+    await _collect_session_events(session.prompt(large_prompt))
+    await _collect_session_events(session.prompt("Keep this recent turn."))
+
+    events = await _collect_session_events(session.prompt("Trigger overflow."))
+
+    compaction_end = next(
+        event
+        for event in events
+        if isinstance(event, CompactionEndEvent) and event.reason == "overflow"
+    )
+    assert compaction_end.aborted is False
+    assert compaction_end.will_retry is False
+    assert compaction_end.error_message == "Overflow compaction failed"
 
 
 @pytest.mark.anyio
