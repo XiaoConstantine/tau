@@ -612,6 +612,13 @@ raw-text views by design; only live transcripts (TUI + print mode) render.
 - `extension_runtime: ExtensionRuntime | None = None` — internal handoff for
   session replacement (resume/new/branch)
 
+**Implemented since — host-only composition:** `CodingSessionConfig.expose_tools_to_model=False`
+keeps the ordinary harness/provider tool-free while `CodingSession.composed_tools` exposes the
+final extension-wrapped catalog to a host-owned control plane. Wrapped tools split
+`prepare_call()` from `execute_prepared()` so extension argument rewrites happen before host
+validation without executing hooks twice, and stale wrappers reject calls after reload. See
+`dev-notes/architecture/host-only-composed-tools.md`.
+
 `CodingSession.load`:
 
 1. creates the runtime and discovers/loads extensions (via `loader.py`) —

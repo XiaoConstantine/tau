@@ -1,5 +1,17 @@
 [
   {
+    "version": "0.3.3",
+    "date": "2026-07-24",
+    "sections": {
+      "New": [
+        "Add host-only composed tools so alternate control planes can reuse trusted extension tools and hooks without exposing native provider tools."
+      ],
+      "Changed": [
+        "Split tool call preparation from prepared execution so hosts can validate extension-rewritten arguments exactly once."
+      ]
+    }
+  },
+  {
     "version": "0.3.2",
     "date": "2026-07-24",
     "sections": {

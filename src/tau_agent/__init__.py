@@ -57,7 +57,9 @@ from tau_agent.session import (
 )
 from tau_agent.tools import (
     AgentTool,
+    AgentToolCallPreparation,
     AgentToolResult,
+    ToolCallPreparer,
     ToolCancellationToken,
     ToolExecutionMode,
     ToolExecutor,

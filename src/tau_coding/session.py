@@ -208,6 +208,14 @@ class CodingSessionConfig:
     append_system_prompt: str | None = None
     context_files: tuple[ProjectContextFile, ...] = ()
     tools: list[AgentTool] | None = None
+    expose_tools_to_model: bool = True
+    """Whether composed tools enter the agent prompt and provider tool list.
+
+    Hosts that execute Tau-composed tools through another provider-neutral control
+    plane may set this to ``False`` and read :attr:`CodingSession.composed_tools`.
+    Extension registration and hooks remain active, but the ordinary agent cannot
+    see or invoke those tools.
+    """
     resource_paths: TauResourcePaths | None = None
     session_id: str | None = None
     session_manager: SessionManager | None = None
@@ -261,11 +269,13 @@ class CodingSession:
         command_registry: CommandRegistry | None = None,
         pending_initial_entries: tuple[SessionEntry, ...] = (),
         extension_runtime: ExtensionRuntime | None = None,
+        composed_tools: tuple[AgentTool, ...] = (),
     ) -> None:
         self._config = config
         self._state = state
         self._harness = harness
         self._extension_runtime = extension_runtime or ExtensionRuntime()
+        self._composed_tools = composed_tools
         self._session_start_pending = False
         self._last_parent_id = last_parent_id
         self._pending_initial_entries = pending_initial_entries
@@ -338,7 +348,11 @@ class CodingSession:
         fresh_extension_runtime = extension_runtime is None
         if extension_runtime is None:
             extension_runtime = ExtensionRuntime()
-            if config.extensions_enabled or config.extension_paths:
+            if (
+                config.extensions_enabled
+                or config.project_extensions_enabled
+                or config.extension_paths
+            ):
                 extension_runtime.load(
                     resource_paths,
                     extra_paths=config.extension_paths,
@@ -354,7 +368,8 @@ class CodingSession:
                 shell_command_prefix=config.shell_command_prefix,
             )
         )
-        tools = extension_runtime.compose_tools(base_tools)
+        composed_tools = extension_runtime.compose_tools(base_tools)
+        tools = composed_tools if config.expose_tools_to_model else []
         system = (
             config.system
             if config.system is not None
@@ -391,6 +406,7 @@ class CodingSession:
             command_registry=config.command_registry or extension_runtime.build_command_registry(),
             pending_initial_entries=pending_initial_entries,
             extension_runtime=extension_runtime,
+            composed_tools=tuple(composed_tools),
         )
         await session._persist_loaded_interrupted_tool_repairs()
         session._sync_thinking_level_to_active_model()
@@ -475,6 +491,15 @@ class CodingSession:
     def tools(self) -> tuple[AgentTool, ...]:
         """Return the tools available to the agent."""
         return tuple(self._harness.config.tools)
+
+    @property
+    def composed_tools(self) -> tuple[AgentTool, ...]:
+        """Return the final extension-wrapped tool catalog for host execution.
+
+        This catalog exists independently of :attr:`tools`, which contains only
+        tools exposed to the ordinary model/provider loop.
+        """
+        return self._composed_tools
 
     @property
     def extension_tool_sources(self) -> dict[str, str]:
@@ -1244,7 +1269,11 @@ class CodingSession:
         the harness event fan-out is re-subscribed.
         """
         self._extension_runtime.reset_for_reload()
-        if self._config.extensions_enabled or self._config.extension_paths:
+        if (
+            self._config.extensions_enabled
+            or self._config.project_extensions_enabled
+            or self._config.extension_paths
+        ):
             self._extension_runtime.load(
                 self._resource_paths,
                 extra_paths=self._config.extension_paths,
@@ -1259,7 +1288,9 @@ class CodingSession:
                 shell_command_prefix=self._config.shell_command_prefix,
             )
         )
-        self._harness.config.tools = self._extension_runtime.compose_tools(base_tools)
+        composed_tools = self._extension_runtime.compose_tools(base_tools)
+        self._composed_tools = tuple(composed_tools)
+        self._harness.config.tools = composed_tools if self._config.expose_tools_to_model else []
         if self._config.command_registry is None:
             self._command_registry = self._extension_runtime.build_command_registry()
         self._extension_runtime.attach_harness_listener(self._harness.subscribe)
@@ -1321,6 +1352,8 @@ class CodingSession:
                 custom_system_prompt=self._config.custom_system_prompt,
                 append_system_prompt=self._config.append_system_prompt,
                 context_files=self._config.context_files,
+                tools=self._config.tools,
+                expose_tools_to_model=self._config.expose_tools_to_model,
                 resource_paths=self._config.resource_paths,
                 session_id=record.id,
                 session_manager=manager,
@@ -1418,6 +1451,7 @@ class CodingSession:
         self._config = replacement._config
         self._state = replacement._state
         self._harness = replacement._harness
+        self._composed_tools = replacement._composed_tools
         self._invalidate_context_usage_cache()
         self._last_parent_id = replacement._last_parent_id
         self._skills = replacement._skills

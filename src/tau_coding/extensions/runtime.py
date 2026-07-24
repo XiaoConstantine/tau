@@ -15,6 +15,7 @@ from tau_agent.events import TurnStartEvent as AgentTurnStartEvent
 from tau_agent.messages import AgentMessage, TextContent
 from tau_agent.tools import (
     AgentTool,
+    AgentToolCallPreparation,
     AgentToolResult,
     ToolCancellationToken,
     ToolUpdateCallback,
@@ -627,26 +628,40 @@ class ExtensionRuntime:
         return [self._wrap_tool(tool) for tool in merged]
 
     def _wrap_tool(self, tool: AgentTool) -> AgentTool:
+        generation = self._generation
+
+        async def prepare_call(
+            arguments: Mapping[str, JSONValue],
+        ) -> AgentToolCallPreparation:
+            generation.assert_active()
+            call_outcome = await self._run_tool_call_hooks(tool.name, arguments)
+            if call_outcome.block:
+                reason = call_outcome.reason or "blocked by an extension"
+                return AgentToolCallPreparation(
+                    arguments=arguments,
+                    blocked_result=AgentToolResult(
+                        content=[TextContent(text=f"Tool call blocked: {reason}")]
+                    ),
+                )
+            effective_arguments = (
+                call_outcome.arguments if call_outcome.arguments is not None else arguments
+            )
+            return await tool.prepare_call(effective_arguments)
+
         async def executor(
             tool_call_id: str,
             arguments: Mapping[str, JSONValue],
             signal: ToolCancellationToken | None = None,
             on_update: ToolUpdateCallback | None = None,
         ) -> AgentToolResult:
-            call_outcome = await self._run_tool_call_hooks(tool.name, arguments)
-            if call_outcome.block:
-                reason = call_outcome.reason or "blocked by an extension"
-                return AgentToolResult(content=[TextContent(text=f"Tool call blocked: {reason}")])
-            effective_arguments = (
-                call_outcome.arguments if call_outcome.arguments is not None else arguments
-            )
-            result = await tool.execute(
+            generation.assert_active()
+            result = await tool.execute_prepared(
                 tool_call_id,
-                effective_arguments,
+                arguments,
                 signal=signal,
                 on_update=on_update,
             )
-            return await self._run_tool_result_hooks(tool.name, effective_arguments, result)
+            return await self._run_tool_result_hooks(tool.name, arguments, result)
 
         return AgentTool(
             name=tool.name,
@@ -656,7 +671,7 @@ class ExtensionRuntime:
             execute_fn=executor,
             prompt_snippet=tool.prompt_snippet,
             prompt_guidelines=tool.prompt_guidelines,
-            prepare_arguments=tool.prepare_arguments,
+            prepare_call_fn=prepare_call,
             execution_mode=tool.execution_mode,
             render_call=tool.render_call,
             render_result=tool.render_result,

@@ -132,7 +132,10 @@ description, a hand-written JSON-schema `parameters` mapping, and an async
 `prompt_snippet` to list it in the system prompt's "Available tools"
 section, and `prompt_guidelines` for usage guidance tied to the tool.
 Registering a tool with a built-in's name (`read`, `write`, `edit`,
-`bash`) replaces the built-in.
+`bash`) replaces the built-in. Host applications may compose extension tools
+without exposing them to Tau's ordinary model loop; those hosts still receive the
+same wrapped executor, call/result hooks, cancellation, and progress behavior.
+After `/reload`, previously captured wrapped tools are stale and reject execution.
 
 A long-running tool can stream progress: an executor that additionally
 uses `on_update` receives a callback accepting an `AgentToolResult`; each call becomes a

@@ -3,6 +3,7 @@
 import asyncio
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
@@ -700,6 +701,39 @@ async def test_tool_call_hook_can_rewrite_arguments(tmp_path: Path) -> None:
     await wrapped.execute("call-1", {"who": "world"})
 
     assert seen == [{"who": "tau"}]
+
+
+async def test_wrapped_tool_can_prepare_once_for_host_validation(tmp_path: Path) -> None:
+    runtime = ExtensionRuntime()
+    api = _register_inline_extension(runtime, "rewrite")
+    hook_calls = 0
+
+    def rewrite(event: object, context: object) -> ToolCallHookResult:
+        nonlocal hook_calls
+        hook_calls += 1
+        return ToolCallHookResult(arguments={"who": "canonical"})
+
+    api.on("tool_call", rewrite)
+    seen: list[dict[str, object]] = []
+
+    async def executor(
+        tool_call_id: str, arguments: object, signal: object = None, on_update: object = None
+    ) -> AgentToolResult:
+        seen.append(dict(arguments))  # type: ignore[call-overload]
+        return AgentToolResult(content="ok")
+
+    wrapped = runtime.compose_tools(
+        [AgentTool(name="echo", label="echo", description="d", parameters={}, execute_fn=executor)]
+    )[0]
+
+    preparation = await wrapped.prepare_call({"who": "original"})
+    result = await wrapped.execute_prepared("call-1", preparation.arguments)
+
+    assert preparation.blocked_result is None
+    assert preparation.arguments == {"who": "canonical"}
+    assert result.text == "ok"
+    assert seen == [{"who": "canonical"}]
+    assert hook_calls == 1
 
 
 async def test_tool_call_hook_can_clear_arguments(tmp_path: Path) -> None:
@@ -1479,6 +1513,38 @@ async def test_session_exposes_extension_tools_and_commands(tmp_path: Path) -> N
     assert "hello" in session.system_prompt
 
 
+async def test_session_can_compose_extension_tools_without_model_exposure(
+    tmp_path: Path,
+) -> None:
+    config = replace(
+        _session_config(
+            tmp_path,
+            FakeProvider([]),
+            extension_body=HELLO_TOOL_EXTENSION,
+        ),
+        tools=[],
+        expose_tools_to_model=False,
+    )
+    session = await CodingSession.load(config)
+
+    assert session.tools == ()
+    assert [tool.name for tool in session.composed_tools] == ["hello"]
+    assert "hello" not in session.system_prompt
+
+    old_tool = session.composed_tools[0]
+    result = await old_tool.execute("call-1", {"who": "RLM"})
+    assert result.text == "hello RLM"
+
+    await session.reload()
+
+    assert session.tools == ()
+    assert [tool.name for tool in session.composed_tools] == ["hello"]
+    with pytest.raises(ExtensionError, match="stale after reload"):
+        await old_tool.execute("call-stale", {"who": "RLM"})
+    fresh = await session.composed_tools[0].execute("call-2", {"who": "RLM"})
+    assert fresh.text == "hello RLM"
+
+
 async def test_extension_guideline_reaches_system_prompt(tmp_path: Path) -> None:
     body = "def setup(tau):\n    tau.add_prompt_guideline('Never commit directly to main')\n"
     session = await CodingSession.load(
@@ -1801,6 +1867,34 @@ async def test_runtime_survives_new_session_swap(tmp_path: Path) -> None:
     assert session.extension_runtime is runtime_before
     assert ("stop", "new") in module.EVENTS
     assert ("start", "new") in module.EVENTS
+
+
+async def test_host_only_composed_tools_survive_resume(tmp_path: Path) -> None:
+    from tau_coding import SessionManager, TauPaths
+
+    provider = FakeProvider([])
+    manager = SessionManager(
+        TauPaths(home=tmp_path / "home-tau", agents_home=tmp_path / "home-agents")
+    )
+    config = replace(
+        _session_config(
+            tmp_path,
+            provider,
+            extension_body=HELLO_TOOL_EXTENSION,
+        ),
+        tools=[],
+        expose_tools_to_model=False,
+        session_manager=manager,
+    )
+    first = manager.create_session(cwd=config.cwd, model="fake")
+    second = manager.create_session(cwd=config.cwd, model="fake")
+    session = await CodingSession.load(replace(config, session_id=first.id))
+
+    await session.resume(second.id)
+
+    assert session.tools == ()
+    assert [tool.name for tool in session.composed_tools] == ["hello"]
+    assert session._config.expose_tools_to_model is False  # noqa: SLF001 - adoption contract
 
 
 async def test_session_swap_clears_host_extension_components(tmp_path: Path) -> None:

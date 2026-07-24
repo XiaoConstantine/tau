@@ -74,6 +74,23 @@ ToolArgumentPreparer = Callable[[object], Mapping[str, JSONValue]]
 
 
 @dataclass(frozen=True, slots=True)
+class AgentToolCallPreparation:
+    """Canonical arguments or a host-owned result that blocks execution."""
+
+    arguments: Mapping[str, JSONValue]
+    blocked_result: AgentToolResult | None = None
+
+
+class ToolCallPreparer(Protocol):
+    def __call__(
+        self,
+        arguments: Mapping[str, JSONValue],
+    ) -> Awaitable[AgentToolCallPreparation]:
+        """Prepare one call before schema validation and execution."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
 class AgentTool:
     """A tool exposed to the portable agent loop."""
 
@@ -88,11 +105,34 @@ class AgentTool:
     execution_mode: ToolExecutionMode = "parallel"
     render_call: ToolCallRenderer | None = None
     render_result: ToolResultRenderer | None = None
+    prepare_call_fn: ToolCallPreparer | None = None
 
     @property
     def input_schema(self) -> Mapping[str, JSONValue]:
         """Alias used by provider payload builders."""
         return self.parameters
+
+    async def prepare_call(
+        self,
+        arguments: Mapping[str, JSONValue],
+    ) -> AgentToolCallPreparation:
+        """Return canonical arguments or a result that blocks execution."""
+        if self.prepare_call_fn is not None:
+            return await self.prepare_call_fn(arguments)
+        prepared = (
+            self.prepare_arguments(arguments) if self.prepare_arguments is not None else arguments
+        )
+        return AgentToolCallPreparation(arguments=prepared)
+
+    async def execute_prepared(
+        self,
+        tool_call_id: str,
+        arguments: Mapping[str, JSONValue],
+        signal: ToolCancellationToken | None = None,
+        on_update: ToolUpdateCallback | None = None,
+    ) -> AgentToolResult:
+        """Execute arguments already canonicalized by :meth:`prepare_call`."""
+        return await self.execute_fn(tool_call_id, arguments, signal, on_update)
 
     async def execute(
         self,
@@ -101,14 +141,24 @@ class AgentTool:
         signal: ToolCancellationToken | None = None,
         on_update: ToolUpdateCallback | None = None,
     ) -> AgentToolResult:
-        """Execute a tool with Pi-compatible call-id and progress semantics."""
-        return await self.execute_fn(tool_call_id, arguments, signal, on_update)
+        """Prepare and execute a tool with Pi-compatible lifecycle semantics."""
+        preparation = await self.prepare_call(arguments)
+        if preparation.blocked_result is not None:
+            return preparation.blocked_result
+        return await self.execute_prepared(
+            tool_call_id,
+            preparation.arguments,
+            signal,
+            on_update,
+        )
 
 
 __all__ = [
     "AgentTool",
+    "AgentToolCallPreparation",
     "AgentToolResult",
     "ToolCall",
+    "ToolCallPreparer",
     "ToolCallRenderer",
     "ToolCancellationToken",
     "ToolExecutionMode",

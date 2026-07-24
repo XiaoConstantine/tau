@@ -99,6 +99,40 @@ rebuild the transcript from `session.messages`.
   `~/.tau/tui.json` via `tau_coding.tui.load_tui_settings()`, but your UI can
   ignore it.
 
+## Host-only composed tools
+
+A host may need Tau's final extension-wrapped tools while using a different
+provider-neutral control plane instead of Tau's ordinary model/tool loop. Configure
+the session with `expose_tools_to_model=False`, then read
+`session.composed_tools`:
+
+```python
+session = await CodingSession.load(
+    CodingSessionConfig(
+        ...,
+        tools=[],
+        expose_tools_to_model=False,
+        extension_paths=(trusted_extension,),
+    )
+)
+
+for tool in session.composed_tools:
+    register_with_host_broker(tool)
+```
+
+`session.tools` is empty in this mode, so tool schemas do not enter Tau's system
+prompt or provider requests. `session.composed_tools` contains the final wrapped
+catalog, including extension call/result hooks. Snapshot the tuple for each host
+run; `/reload` replaces it and stale wrapped tools reject execution. Extension
+loading remains a trust decision, and the host must independently allow-list and
+sandbox any tool it executes.
+
+A host that validates rewritten arguments before execution should call
+`await tool.prepare_call(arguments)`, validate `preparation.arguments`, return
+`preparation.blocked_result` when present, then invoke
+`tool.execute_prepared(...)`. Ordinary callers should continue using
+`tool.execute(...)`, which performs both stages.
+
 ## What not to depend on
 
 Avoid coupling to private `CodingSession` attributes, provider-specific response
