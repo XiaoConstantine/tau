@@ -2,14 +2,22 @@
 
 from __future__ import annotations
 
+import logging
+import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from time import time
+from typing import BinaryIO
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from tau_coding.paths import TauPaths
+
+logger = logging.getLogger(__name__)
 
 
 class SessionRecordModel(BaseModel):
@@ -214,11 +222,20 @@ class SessionManager:
         records: list[CodingSessionRecord] = []
         # Split on newlines only: str.splitlines() would also split on characters
         # like U+2028 that appear unescaped inside JSON string values.
-        for line in path.read_text(encoding="utf-8").split("\n"):
+        for line_number, line in enumerate(path.read_text(encoding="utf-8").split("\n"), start=1):
             stripped = line.strip()
             if not stripped:
                 continue
-            model = SessionRecordModel.model_validate_json(stripped)
+            try:
+                model = SessionRecordModel.model_validate_json(stripped)
+            except ValidationError as exc:
+                logger.warning(
+                    "Ignoring invalid session index entry at %s:%d: %s",
+                    path,
+                    line_number,
+                    exc,
+                )
+                continue
             records.append(CodingSessionRecord.from_model(model))
         return records
 
@@ -241,13 +258,89 @@ class SessionManager:
         content = "\n".join(record.to_model().model_dump_json() for record in records)
         if content:
             content += "\n"
-        path.write_text(content, encoding="utf-8")
+        _atomic_write_text(path, content)
 
     def _upsert(self, record: CodingSessionRecord) -> None:
         path = self.project_index_path(record.cwd)
-        records = [item for item in self._read_index(path) if item.id != record.id]
-        records.append(record)
-        self._write_index(path, records)
+        lock_path = path.with_name(f".{path.name}.lock")
+        with _exclusive_file_lock(lock_path):
+            records = [item for item in self._read_index(path) if item.id != record.id]
+            records.append(record)
+            self._write_index(path, records)
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Atomically replace *path* with durable UTF-8 text."""
+    temp_path: Path | None = None
+    try:
+        with NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            temp_path = Path(temp_file.name)
+            temp_file.write(content)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+        temp_path.replace(path)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
+@contextmanager
+def _exclusive_file_lock(path: Path) -> Iterator[None]:
+    """Serialize index updates across Tau processes."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as lock_file:
+        _acquire_file_lock(lock_file)
+        try:
+            yield
+        finally:
+            _release_file_lock(lock_file)
+
+
+def _acquire_file_lock(lock_file: BinaryIO) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        _ensure_lock_byte(lock_file)
+        lock_file.seek(0)
+        locking = msvcrt.locking  # type: ignore[attr-defined]
+        lock_mode = msvcrt.LK_LOCK  # type: ignore[attr-defined]
+        locking(lock_file.fileno(), lock_mode, 1)
+        return
+
+    import fcntl
+
+    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+
+
+def _release_file_lock(lock_file: BinaryIO) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        lock_file.seek(0)
+        locking = msvcrt.locking  # type: ignore[attr-defined]
+        unlock_mode = msvcrt.LK_UNLCK  # type: ignore[attr-defined]
+        locking(lock_file.fileno(), unlock_mode, 1)
+        return
+
+    import fcntl
+
+    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _ensure_lock_byte(lock_file: BinaryIO) -> None:
+    """Give Windows an existing byte range for ``msvcrt.locking``."""
+    lock_file.seek(0, os.SEEK_END)
+    if lock_file.tell() == 0:
+        lock_file.write(b"\0")
+        lock_file.flush()
+    lock_file.seek(0)
 
 
 def _deduplicate_records(records: list[CodingSessionRecord]) -> list[CodingSessionRecord]:
