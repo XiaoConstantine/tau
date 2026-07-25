@@ -1,5 +1,17 @@
 [
   {
+    "version": "0.3.4",
+    "date": "2026-07-25",
+    "sections": {
+      "New": [
+        "Add immutable tool effect and provenance metadata so alternate host brokers can distinguish confined built-ins from generation-bound extension assertions."
+      ],
+      "Changed": [
+        "Classify built-in read, write, edit, and Bash tools by effect while preserving backward-compatible defaults for third-party AgentTool constructors."
+      ]
+    }
+  },
+  {
     "version": "0.3.3",
     "date": "2026-07-24",
     "sections": {

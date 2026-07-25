@@ -25,8 +25,10 @@ from typing import Any
 from tau_agent.messages import TextContent
 from tau_agent.tools import (
     AgentTool,
+    AgentToolProvenance,
     AgentToolResult,
     ToolCancellationToken,
+    ToolEffect,
     ToolUpdateCallback,
 )
 from tau_agent.types import JSONValue
@@ -86,6 +88,7 @@ class ToolDefinition:
     executor: Callable[
         [Mapping[str, JSONValue], ToolCancellationToken | None], Awaitable[AgentToolResult]
     ]
+    effect: ToolEffect = "unknown"
 
     def to_agent_tool(self) -> AgentTool:
         """Convert the coding definition to the Pi-compatible core tool."""
@@ -107,6 +110,12 @@ class ToolDefinition:
             execute_fn=execute,
             prompt_snippet=self.prompt_snippet,
             prompt_guidelines=self.prompt_guidelines,
+            effect=self.effect,
+            provenance=AgentToolProvenance(
+                source="builtin",
+                identifier=self.name,
+                enforcement="host_confined",
+            ),
         )
 
 
@@ -263,6 +272,7 @@ def create_read_tool_definition(*, cwd: str | Path | None = None) -> ToolDefinit
             "required": ["path"],
         },
         executor=execute,
+        effect="read",
     )
 
 
@@ -320,6 +330,7 @@ def create_write_tool_definition(*, cwd: str | Path | None = None) -> ToolDefini
             "required": ["path", "content"],
         },
         executor=execute,
+        effect="write",
     )
 
 
@@ -430,6 +441,7 @@ def create_edit_tool_definition(*, cwd: str | Path | None = None) -> ToolDefinit
             "additionalProperties": False,
         },
         executor=execute,
+        effect="write",
     )
 
 
@@ -571,6 +583,7 @@ def create_bash_tool_definition(
             "required": ["command"],
         },
         executor=execute,
+        effect="execute",
     )
 
 

@@ -70,7 +70,28 @@ class ToolExecutor(Protocol):
 
 
 ToolExecutionMode = Literal["sequential", "parallel"]
+ToolEffect = Literal["pure", "read", "write", "execute", "network", "unknown"]
+ToolEnforcement = Literal["host_confined", "host_asserted", "unknown"]
 ToolArgumentPreparer = Callable[[object], Mapping[str, JSONValue]]
+
+
+@dataclass(frozen=True, slots=True)
+class AgentToolProvenance:
+    """Host-supplied origin and enforcement metadata for one tool definition."""
+
+    source: Literal["builtin", "extension", "host", "unknown"] = "unknown"
+    identifier: str | None = None
+    generation: str | None = None
+    enforcement: ToolEnforcement = "unknown"
+
+    def __post_init__(self) -> None:
+        if self.source not in ("builtin", "extension", "host", "unknown"):
+            raise ValueError(f"unsupported tool provenance source: {self.source!r}")
+        if self.enforcement not in ("host_confined", "host_asserted", "unknown"):
+            raise ValueError(f"unsupported tool enforcement: {self.enforcement!r}")
+        for name, value in (("identifier", self.identifier), ("generation", self.generation)):
+            if value is not None and (not value or len(value) > 512):
+                raise ValueError(f"tool provenance {name} must contain 1 to 512 characters")
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +127,12 @@ class AgentTool:
     render_call: ToolCallRenderer | None = None
     render_result: ToolResultRenderer | None = None
     prepare_call_fn: ToolCallPreparer | None = None
+    effect: ToolEffect = "unknown"
+    provenance: AgentToolProvenance = AgentToolProvenance()
+
+    def __post_init__(self) -> None:
+        if self.effect not in ("pure", "read", "write", "execute", "network", "unknown"):
+            raise ValueError(f"unsupported tool effect: {self.effect!r}")
 
     @property
     def input_schema(self) -> Mapping[str, JSONValue]:
@@ -155,12 +182,15 @@ class AgentTool:
 
 __all__ = [
     "AgentTool",
+    "AgentToolProvenance",
     "AgentToolCallPreparation",
     "AgentToolResult",
     "ToolCall",
     "ToolCallPreparer",
     "ToolCallRenderer",
     "ToolCancellationToken",
+    "ToolEffect",
+    "ToolEnforcement",
     "ToolExecutionMode",
     "ToolResultRenderer",
     "ToolExecutor",

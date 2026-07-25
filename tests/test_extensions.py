@@ -13,7 +13,7 @@ from pi_event_helpers import assistant_done, assistant_start
 from tau_agent import AssistantMessage, ToolCall, UserMessage
 from tau_agent.messages import AgentMessage, assistant_content
 from tau_agent.session import CustomEntry, JsonlSessionStorage, LeafEntry, MessageEntry
-from tau_agent.tools import AgentTool, AgentToolResult
+from tau_agent.tools import AgentTool, AgentToolProvenance, AgentToolResult
 from tau_agent.types import JSONValue
 from tau_ai import FakeProvider
 from tau_coding import CodingSession, CodingSessionConfig, TauResourcePaths
@@ -71,6 +71,7 @@ def setup(tau):
             parameters={"type": "object", "properties": {"who": {"type": "string"}}},
             execute_fn=_run,
             prompt_snippet="Greet someone by name.",
+            effect="pure",
         )
     )
 """
@@ -509,6 +510,23 @@ def test_setup_failure_rolls_back_registrations(tmp_path: Path) -> None:
     assert any("setup failed" in diag.message for diag in runtime.diagnostics)
 
 
+def test_agent_tool_rejects_invalid_effect_and_provenance_metadata() -> None:
+    async def execute(*_args: object, **_kwargs: object) -> AgentToolResult:
+        return AgentToolResult(content="unused")
+
+    with pytest.raises(ValueError, match="unsupported tool effect"):
+        AgentTool(
+            name="bad",
+            label="Bad",
+            description="Bad effect",
+            parameters={},
+            execute_fn=execute,
+            effect=cast(object, "mutation"),  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="unsupported tool provenance source"):
+        AgentToolProvenance(source=cast(object, "forged"))  # type: ignore[arg-type]
+
+
 def test_extension_tool_registration_and_composition(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
     _write_extension(_user_extensions_dir(paths), "hello_ext", HELLO_TOOL_EXTENSION)
@@ -517,6 +535,11 @@ def test_extension_tool_registration_and_composition(tmp_path: Path) -> None:
     composed = runtime.compose_tools([])
 
     assert [tool.name for tool in composed] == ["hello"]
+    assert composed[0].effect == "pure"
+    assert composed[0].provenance.source == "extension"
+    assert composed[0].provenance.identifier == "hello_ext"
+    assert composed[0].provenance.generation
+    assert composed[0].provenance.enforcement == "host_asserted"
     assert runtime.extension_tool_sources == {"hello": "hello_ext"}
 
 

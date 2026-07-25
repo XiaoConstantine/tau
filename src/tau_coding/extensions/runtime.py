@@ -16,6 +16,7 @@ from tau_agent.messages import AgentMessage, TextContent
 from tau_agent.tools import (
     AgentTool,
     AgentToolCallPreparation,
+    AgentToolProvenance,
     AgentToolResult,
     ToolCancellationToken,
     ToolUpdateCallback,
@@ -619,16 +620,33 @@ class ExtensionRuntime:
         Extension tools override built-ins with the same name in place;
         extension-only tools append in registration order.
         """
-        merged: list[AgentTool] = []
+        merged: list[tuple[AgentTool, str | None]] = []
         extension_tools = dict(self._tools)
         for tool in builtin_tools:
             override = extension_tools.pop(tool.name, None)
-            merged.append(override.tool if override is not None else tool)
-        merged.extend(registration.tool for registration in extension_tools.values())
-        return [self._wrap_tool(tool) for tool in merged]
+            if override is None:
+                merged.append((tool, None))
+            else:
+                merged.append((override.tool, override.extension))
+        merged.extend(
+            (registration.tool, registration.extension) for registration in extension_tools.values()
+        )
+        return [
+            self._wrap_tool(tool, extension_name=extension_name) for tool, extension_name in merged
+        ]
 
-    def _wrap_tool(self, tool: AgentTool) -> AgentTool:
+    def _wrap_tool(self, tool: AgentTool, *, extension_name: str | None) -> AgentTool:
         generation = self._generation
+        provenance = (
+            tool.provenance
+            if extension_name is None
+            else AgentToolProvenance(
+                source="extension",
+                identifier=extension_name,
+                generation=generation.generation_id,
+                enforcement="host_asserted",
+            )
+        )
 
         async def prepare_call(
             arguments: Mapping[str, JSONValue],
@@ -675,6 +693,8 @@ class ExtensionRuntime:
             execution_mode=tool.execution_mode,
             render_call=tool.render_call,
             render_result=tool.render_result,
+            effect=tool.effect,
+            provenance=provenance,
         )
 
     async def _run_tool_call_hooks(

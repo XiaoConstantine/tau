@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, cast
+from uuid import uuid4
 
 from tau_agent.messages import AgentMessage, ToolResultMessage
 from tau_agent.tools import AgentTool, AgentToolResult
@@ -291,10 +292,16 @@ class ExtensionGeneration:
     the phase-21 lifecycle Ruling).
     """
 
-    __slots__ = ("_stale_message",)
+    __slots__ = ("_generation_id", "_stale_message")
 
     def __init__(self) -> None:
+        self._generation_id = uuid4().hex
         self._stale_message: str | None = None
+
+    @property
+    def generation_id(self) -> str:
+        """Return the immutable public identity of this load generation."""
+        return self._generation_id
 
     @property
     def active(self) -> bool:

@@ -125,7 +125,11 @@ prompt or provider requests. `session.composed_tools` contains the final wrapped
 catalog, including extension call/result hooks. Snapshot the tuple for each host
 run; `/reload` replaces it and stale wrapped tools reject execution. Extension
 loading remains a trust decision, and the host must independently allow-list and
-sandbox any tool it executes.
+sandbox any tool it executes. Every `AgentTool` also carries `effect` and immutable
+`provenance` metadata. Tau marks built-in coding tools as host-confined and wrapped
+extension tools with the extension name and load-generation identity; extension
+effects remain host-asserted. Brokers must reject effect mismatches and must not
+interpret an asserted `read` label as proof of confinement.
 
 A host that validates rewritten arguments before execution should call
 `await tool.prepare_call(arguments)`, validate `preparation.arguments`, return

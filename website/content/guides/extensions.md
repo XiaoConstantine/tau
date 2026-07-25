@@ -35,9 +35,15 @@ def setup(tau):
             },
             execute_fn=run_greet,
             prompt_snippet="Greet someone by name.",
+            effect="pure",
         )
     )
 ```
+
+`effect` declares the tool's host-visible side-effect class: `pure`, `read`,
+`write`, `execute`, `network`, or `unknown` (the default). This is an extension
+trust assertion, not a sandbox guarantee. Alternate host brokers should deny
+unknown or unsupported effects and separately allow-list tools by name.
 
 Start `tau` and the model can call `greet`. Every extension is a module
 defining `setup(tau)`, which runs once at startup with the extension API.
