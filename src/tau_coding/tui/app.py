@@ -880,6 +880,8 @@ class ExtensionConfirmScreen(ModalScreen[bool]):
         Binding("escape", "cancel", "Cancel"),
         Binding("up", "cursor_up", "Up", show=False),
         Binding("down", "cursor_down", "Down", show=False),
+        Binding("pageup", "scroll_up", "Review up", show=False),
+        Binding("pagedown", "scroll_down", "Review down", show=False),
         Binding("enter", "select_cursor", "Select", show=False),
     ]
 
@@ -901,7 +903,8 @@ class ExtensionConfirmScreen(ModalScreen[bool]):
         """Compose the confirmation dialog."""
         with Vertical(id="extension-confirm"):
             yield Static(self.title_text, id="extension-confirm-title", markup=False)
-            yield Static(self.message, id="extension-confirm-message", markup=False)
+            with VerticalScroll(id="extension-confirm-message-scroll"):
+                yield Static(self.message, id="extension-confirm-message", markup=False)
             yield ListView(
                 ListItem(Label("Yes", markup=False)),
                 ListItem(Label("No", markup=False)),
@@ -923,6 +926,12 @@ class ExtensionConfirmScreen(ModalScreen[bool]):
         elif event.key == "down":
             event.stop()
             self.action_cursor_down()
+        elif event.key == "pageup":
+            event.stop()
+            self.action_scroll_up()
+        elif event.key == "pagedown":
+            event.stop()
+            self.action_scroll_down()
         elif event.key == "enter":
             event.stop()
             self.action_select_cursor()
@@ -942,6 +951,14 @@ class ExtensionConfirmScreen(ModalScreen[bool]):
     def action_select_cursor(self) -> None:
         """Select the highlighted choice."""
         self.query_one("#extension-confirm-list", ListView).action_select_cursor()
+
+    def action_scroll_up(self) -> None:
+        """Scroll the literal confirmation message toward its start."""
+        self.query_one("#extension-confirm-message-scroll", VerticalScroll).scroll_page_up()
+
+    def action_scroll_down(self) -> None:
+        """Scroll the literal confirmation message toward its end."""
+        self.query_one("#extension-confirm-message-scroll", VerticalScroll).scroll_page_down()
 
     def action_cancel(self) -> None:
         """Close, declining the confirmation."""
@@ -3159,10 +3176,15 @@ class TauTuiApp(App[None]):
         margin-bottom: 1;
     }
 
-    #extension-confirm-message {
+    #extension-confirm-message-scroll {
         height: auto;
+        max-height: 20;
         color: $tau-chrome-text;
         margin-bottom: 1;
+    }
+
+    #extension-confirm-message {
+        height: auto;
     }
 
     #extension-select-list,

@@ -4,7 +4,7 @@
 
 The internal `UiBridge.confirm(...)` host seam now accepts `default: bool = True`. Existing extension-facing calls preserve the prior Yes-first behavior, while trusted host integrations can request `default=False` for security-sensitive approval dialogs.
 
-Cancelling the coroutine waiting on any Textual extension dialog now dismisses that dialog when it is still the active screen. Timeout continues to return the no-op default.
+Cancelling the coroutine waiting on any Textual extension dialog now removes that specific dialog, including when another modal covers it. Timeout continues to return the no-op default. Confirmation messages are placed in a bounded literal-text scroll viewport; Page Up/Down allow complete review without changing the selected decision.
 
 ## Why
 
