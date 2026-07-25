@@ -485,8 +485,9 @@ class UiBridge(Protocol):
         message: str,
         *,
         timeout: float | None = None,
+        default: bool = True,
     ) -> bool:
-        """Show a confirmation; return True only if confirmed."""
+        """Show a confirmation with the initially selected decision."""
         ...
 
     async def input(
@@ -599,6 +600,7 @@ class NullUiBridge:
         message: str,
         *,
         timeout: float | None = None,
+        default: bool = True,
     ) -> bool:
         """Return False: no UI to confirm with (Pi no-op default)."""
         return False

@@ -268,10 +268,13 @@ class _TuiExtensionUiBridge:
         message: str,
         *,
         timeout: float | None = None,
+        default: bool = True,
     ) -> bool:
         """Show a modal confirmation; True only if confirmed."""
         theme = self._app.tui_settings.resolved_theme
-        screen: ModalScreen[bool] = ExtensionConfirmScreen(title, message, theme=theme)
+        screen: ModalScreen[bool] = ExtensionConfirmScreen(
+            title, message, theme=theme, default=default
+        )
         return await self._run_dialog(screen, default=False, timeout=timeout)
 
     async def input(
@@ -368,17 +371,25 @@ class _TuiExtensionUiBridge:
                 future.set_result(default if result is None else result)
 
         self._app.push_screen(screen, _resolve)
-        if timeout is None:
-            return await future
         try:
+            if timeout is None:
+                return await future
             return await asyncio.wait_for(future, timeout)
+        except asyncio.CancelledError:
+            with suppress(Exception):
+                if self._app.screen is screen:
+                    screen.dismiss(default)
+                elif screen in self._app._screen_stack:
+                    self._app._screen_stack.remove(screen)
+                    await screen.remove()
+            raise
         except TimeoutError:
             # `Screen.dismiss` only works while the dialog is the top screen.
             # Known limitation: if another screen was pushed on top before the
             # timeout fired, the stale dialog stays on the stack (its future
             # result is discarded by `_resolve` racing `future.done()`) until
             # the covering screen closes and the user dismisses it manually.
-            if screen.is_current:
+            if self._app.screen is screen:
                 with suppress(Exception):
                     screen.dismiss(default)
             return default
@@ -872,11 +883,19 @@ class ExtensionConfirmScreen(ModalScreen[bool]):
         Binding("enter", "select_cursor", "Select", show=False),
     ]
 
-    def __init__(self, title: str, message: str, *, theme: TuiTheme) -> None:
+    def __init__(
+        self,
+        title: str,
+        message: str,
+        *,
+        theme: TuiTheme,
+        default: bool = True,
+    ) -> None:
         super().__init__()
         self.title_text = title
         self.message = message
         self.theme = theme
+        self.default = default
 
     def compose(self) -> ComposeResult:
         """Compose the confirmation dialog."""
@@ -893,7 +912,7 @@ class ExtensionConfirmScreen(ModalScreen[bool]):
     def on_mount(self) -> None:
         """Focus the choice list."""
         choice_list = self.query_one("#extension-confirm-list", ListView)
-        choice_list.index = 0
+        choice_list.index = 0 if self.default else 1
         choice_list.focus()
 
     def on_key(self, event: Key) -> None:

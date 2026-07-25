@@ -1,5 +1,17 @@
 [
   {
+    "version": "0.3.5",
+    "date": "2026-07-25",
+    "sections": {
+      "Changed": [
+        "Allow host integrations to choose a deny-first confirmation default without changing existing extension behavior."
+      ],
+      "Fixed": [
+        "Dismiss active extension dialogs when their awaiting coroutine is cancelled so security-sensitive prompts cannot become orphaned modals."
+      ]
+    }
+  },
+  {
     "version": "0.3.4",
     "date": "2026-07-25",
     "sections": {

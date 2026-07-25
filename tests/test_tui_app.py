@@ -646,7 +646,7 @@ def test_session_sidebar_brand_includes_current_version() -> None:
 
     console.print(_sidebar_brand(theme=TAU_DARK_THEME))
 
-    assert "τ = 2π  0.3.4" in console.export_text()
+    assert "τ = 2π  0.3.5" in console.export_text()
 
 
 def test_session_sidebar_uses_prominent_title_and_accented_section_headers() -> None:
@@ -3383,6 +3383,53 @@ async def test_extension_confirm_dialog_yes_and_cancel() -> None:
         await pilot.pause()
         await pilot.press("escape")
         assert await cancel_task is False
+
+        deny_default_task = asyncio.ensure_future(
+            bridge.confirm("Approve?", "proposal", default=False)
+        )
+        await pilot.pause()
+        await pilot.press("enter")
+        assert await deny_default_task is False
+
+
+@pytest.mark.anyio
+async def test_extension_confirm_dialog_cancellation_dismisses_modal() -> None:
+    app = TauTuiApp(FakeSession())  # type: ignore[arg-type]
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        bridge = _TuiExtensionUiBridge(app)
+        task = asyncio.ensure_future(bridge.confirm("Approve?", "proposal"))
+        await pilot.pause()
+        assert isinstance(app.screen, ExtensionConfirmScreen)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await pilot.pause()
+        assert not isinstance(app.screen, ExtensionConfirmScreen)
+
+
+@pytest.mark.anyio
+async def test_cancelled_covered_confirm_dialog_is_removed() -> None:
+    app = TauTuiApp(FakeSession())  # type: ignore[arg-type]
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        bridge = _TuiExtensionUiBridge(app)
+        task = asyncio.ensure_future(bridge.confirm("Approve?", "stale proposal"))
+        await pilot.pause()
+        stale_screen = app.screen
+        covering = ExtensionConfirmScreen("Other", "current", theme=app.tui_settings.resolved_theme)
+        await app.push_screen(covering)
+        await pilot.pause()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await pilot.pause()
+        if covering in app.screen_stack:
+            await pilot.press("escape")
+            await pilot.pause()
+        assert stale_screen not in app.screen_stack
 
 
 @pytest.mark.anyio
